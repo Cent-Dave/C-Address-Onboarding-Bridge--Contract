@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec,
 };
 
 #[contracterror]
@@ -278,6 +278,14 @@ impl OnboardingBridge {
 
     pub fn query_is_paused(env: Env) -> bool {
         read_paused(&env)
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        check_initialized(&env);
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.events().publish(("Upgraded",), (admin, new_wasm_hash));
     }
 }
 

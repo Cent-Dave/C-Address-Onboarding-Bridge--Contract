@@ -3,7 +3,7 @@ use crate::OnboardingBridge;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Events},
-    Address, Env, IntoVal, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, Vec,
 };
 
 fn register_all_contracts(env: &Env) -> (Address, Address) {
@@ -473,6 +473,55 @@ fn test_fund_works_after_unpause() {
     bridge.fund_c_address(&user, &target, &token_id, &500i128);
 
     assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+}
+
+// The soroban-sdk ships a known-good compiled wasm fixture used for doc/unit
+// tests. We reuse it here as our "v2" wasm to get a real BytesN<32> hash that
+// the host accepts, so we can exercise the full auth → wasm-swap → event path.
+const V2_WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32-unknown-unknown/release/onboarding_bridge.wasm"
+));
+
+#[test]
+fn test_upgrade_admin_only_and_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    env.mock_all_auths();
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+
+    let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
+    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+
+    bridge.upgrade(&wasm_hash);
+
+    // Verify the Upgraded event was emitted from the bridge contract.
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
+}
+
+#[test]
+#[should_panic]
+fn test_upgrade_non_admin_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let bridge_id = env.register(OnboardingBridge, ());
+    env.mock_all_auths();
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+
+    let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
+    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+
+    // Clear all mocked auths so upgrade is called without admin authorization.
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+    bridge.upgrade(&wasm_hash);
 }
 
 /********** Minimal Test Token **********/
