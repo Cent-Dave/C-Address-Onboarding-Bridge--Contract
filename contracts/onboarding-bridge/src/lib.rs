@@ -10,6 +10,7 @@ pub enum BridgeError {
     InvalidAmount = 3,
     FeeTooHigh = 4,
     MismatchedArrays = 5,
+    BelowMinimum = 6,
 }
 
 #[contracttype]
@@ -18,6 +19,7 @@ pub enum DataKey {
     FeeCollector,
     FeeBps,
     Initialized,
+    MinAmount,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -65,6 +67,13 @@ fn check_initialized(env: &Env) -> Result<(), BridgeError> {
     Ok(())
 }
 
+fn read_min_amount(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MinAmount)
+        .unwrap_or(0)
+}
+
 fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
     (amount * fee_bps as i128) / FEE_DENOMINATOR
 }
@@ -99,6 +108,10 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
+        }
+        let min_amount = read_min_amount(&env);
+        if amount < min_amount {
+            return Err(BridgeError::BelowMinimum);
         }
         source.require_auth();
 
@@ -136,11 +149,15 @@ impl OnboardingBridge {
         }
         source.require_auth();
 
+        let min_amount = read_min_amount(&env);
         let mut total: i128 = 0;
         for i in 0..targets.len() {
             let amount = amounts.get(i).unwrap();
             if amount <= 0 {
                 return Err(BridgeError::InvalidAmount);
+            }
+            if amount < min_amount {
+                return Err(BridgeError::BelowMinimum);
             }
             total += amount;
         }
@@ -225,6 +242,18 @@ impl OnboardingBridge {
     pub fn query_admin(env: Env) -> Result<Address, BridgeError> {
         check_initialized(&env)?;
         Ok(read_admin(&env))
+    }
+
+    pub fn set_minimum_amount(env: Env, min_amount: i128) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::MinAmount, &min_amount);
+        Ok(())
+    }
+
+    pub fn query_minimum_amount(env: Env) -> i128 {
+        read_min_amount(&env)
     }
 
     pub fn query_balance(env: Env, c_address: Address, asset: Address) -> i128 {

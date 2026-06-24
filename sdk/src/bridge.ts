@@ -386,6 +386,66 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Set the minimum amount for fund_c_address and batch_fund_c_address (admin only).
+   */
+  async setMinimumAmount(
+    minAmount: string | bigint,
+    adminKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(
+        adminKeypair.publicKey(),
+      );
+
+      const tx = new TransactionBuilder(adminAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'set_minimum_amount',
+            ...this.toScVals([minAmount]),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return {
+        hash: response.hash,
+        status: response.status === 'ERROR' ? 'failed' : 'pending',
+      };
+    } catch (error: any) {
+      return {
+        hash: '',
+        status: 'failed',
+        error: error.message || 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Get the current minimum amount floor for fund operations.
+   */
+  async getMinimumAmount(): Promise<string> {
+    const result = await this.provider
+      .simulateTransaction(
+        this.buildSimulationTx('query_minimum_amount', []),
+      );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get minimum amount: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? scValToNative(scVal).toString() : '0';
+  }
+
+  /**
    * Convert JavaScript values to Soroban SCVals.
    */
   private toScVals(args: any[]): xdr.ScVal[] {

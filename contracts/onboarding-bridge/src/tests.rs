@@ -307,6 +307,109 @@ fn test_query_fee_bps_uninitialized() {
     );
 }
 
+#[test]
+fn test_minimum_amount_default_zero() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    assert_eq!(bridge.query_minimum_amount(), 0i128);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &1i128);
+    assert_eq!(check_balance(&env, &token_id, &target), 1i128);
+}
+
+#[test]
+fn test_set_minimum_amount() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    assert_eq!(bridge.query_minimum_amount(), 0i128);
+
+    bridge.set_minimum_amount(&100i128);
+    assert_eq!(bridge.query_minimum_amount(), 100i128);
+}
+
+#[test]
+fn test_fund_below_minimum_panics() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    bridge.set_minimum_amount(&100i128);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &99i128),
+        Err(Ok(BridgeError::BelowMinimum))
+    );
+}
+
+#[test]
+fn test_fund_at_minimum_passes() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    bridge.set_minimum_amount(&100i128);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &100i128);
+    assert_eq!(check_balance(&env, &token_id, &target), 100i128);
+}
+
+#[test]
+fn test_batch_fund_below_minimum_panics() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    bridge.set_minimum_amount(&100i128);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target1.clone(), target2.clone()]);
+    let amounts = Vec::from_array(&env, [200i128, 50i128]);
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id),
+        Err(Ok(BridgeError::BelowMinimum))
+    );
+}
+
+#[test]
+fn test_set_minimum_amount_unauthorized() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+
+    env.mock_auths(&[]);
+    assert!(bridge.try_set_minimum_amount(&100i128).is_err());
+}
+
 /********** Minimal Test Token **********/
 
 #[contracttype]
