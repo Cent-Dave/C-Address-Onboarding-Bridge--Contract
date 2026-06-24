@@ -20,6 +20,7 @@ pub enum DataKey {
     FeeCollector,
     FeeBps,
     Initialized,
+    Paused,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -76,6 +77,19 @@ fn check_initialized(env: &Env) {
     }
 }
 
+fn read_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn check_not_paused(env: &Env) {
+    if read_paused(env) {
+        panic!("contract is paused");
+    }
+}
+
 fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
     (amount * fee_bps as i128) / FEE_DENOMINATOR
 }
@@ -107,6 +121,7 @@ impl OnboardingBridge {
         amount: i128,
     ) {
         check_initialized(&env);
+        check_not_paused(&env);
         if amount <= 0 {
             panic!("invalid amount");
         }
@@ -137,6 +152,7 @@ impl OnboardingBridge {
         asset: Address,
     ) {
         check_initialized(&env);
+        check_not_paused(&env);
         if targets.len() != amounts.len() {
             panic!("mismatched arrays");
         }
@@ -179,6 +195,7 @@ impl OnboardingBridge {
 
     pub fn set_fee_bps(env: Env, new_fee_bps: u32) {
         check_initialized(&env);
+        check_not_paused(&env);
         if new_fee_bps > MAX_FEE_BPS {
             panic!("fee too high");
         }
@@ -189,6 +206,7 @@ impl OnboardingBridge {
 
     pub fn set_fee_collector(env: Env, new_fee_collector: Address) {
         check_initialized(&env);
+        check_not_paused(&env);
         let admin = read_admin(&env);
         admin.require_auth();
         save_fee_collector(&env, &new_fee_collector);
@@ -196,6 +214,7 @@ impl OnboardingBridge {
 
     pub fn set_admin(env: Env, new_admin: Address) {
         check_initialized(&env);
+        check_not_paused(&env);
         let admin = read_admin(&env);
         admin.require_auth();
         save_admin(&env, &new_admin);
@@ -203,6 +222,7 @@ impl OnboardingBridge {
 
     pub fn withdraw_fees(env: Env, asset: Address, amount: i128) {
         check_initialized(&env);
+        check_not_paused(&env);
         if amount <= 0 {
             panic!("invalid amount");
         }
@@ -238,6 +258,26 @@ impl OnboardingBridge {
 
     pub fn query_is_initialized(env: Env) -> bool {
         read_initialized(&env)
+    }
+
+    pub fn pause(env: Env) {
+        check_initialized(&env);
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(("ContractPaused",), (admin,));
+    }
+
+    pub fn unpause(env: Env) {
+        check_initialized(&env);
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(("ContractUnpaused",), (admin,));
+    }
+
+    pub fn query_is_paused(env: Env) -> bool {
+        read_paused(&env)
     }
 }
 
