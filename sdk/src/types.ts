@@ -38,6 +38,15 @@ export interface WithdrawFeesOptions {
   amount: string;
 }
 
+export interface ReclaimTokensOptions {
+  /** Asset contract address to reclaim */
+  asset: string;
+  /** Amount to reclaim */
+  amount: string;
+  /** Destination address to receive the reclaimed tokens */
+  to: string;
+}
+
 export interface OffRampConfig {
   /** Your Moonpay API key */
   moonpayApiKey?: string;

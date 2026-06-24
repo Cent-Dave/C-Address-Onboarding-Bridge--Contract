@@ -3,6 +3,7 @@ import {
   FundCOptions,
   BatchFundCOptions,
   WithdrawFeesOptions,
+  ReclaimTokensOptions,
   TransactionResult,
 } from './types';
 import {
@@ -152,6 +153,49 @@ export class OnboardingBridgeSDK {
 
       const preparedTx = await this.provider.prepareTransaction(tx);
       preparedTx.sign(feeCollectorKeypair);
+
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return {
+        hash: response.hash,
+        status: response.status === 'ERROR' ? 'failed' : 'pending',
+      };
+    } catch (error: any) {
+      return {
+        hash: '',
+        status: 'failed',
+        error: error.message || 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Reclaim tokens accidentally sent to the contract (admin only).
+   */
+  async reclaimTokens(
+    options: ReclaimTokensOptions,
+    adminKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(
+        adminKeypair.publicKey(),
+      );
+
+      const tx = new TransactionBuilder(adminAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'reclaim_tokens',
+            ...this.toScVals([options.asset, options.amount, options.to]),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
 
       const response = await this.provider.sendTransaction(preparedTx);
 

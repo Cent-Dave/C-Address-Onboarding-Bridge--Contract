@@ -307,6 +307,76 @@ fn test_query_fee_bps_uninitialized() {
     );
 }
 
+#[test]
+fn test_reclaim_tokens() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    mint_tokens(&env, &token_id, &bridge_id, 500i128);
+
+    let recipient = Address::generate(&env);
+    bridge.reclaim_tokens(&token_id, &200i128, &recipient);
+
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 300i128);
+    assert_eq!(check_balance(&env, &token_id, &recipient), 200i128);
+}
+
+#[test]
+fn test_reclaim_tokens_zero_amount() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        bridge.try_reclaim_tokens(&token_id, &0i128, &recipient),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+}
+
+#[test]
+fn test_reclaim_tokens_unauthorized() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    let recipient = Address::generate(&env);
+
+    env.mock_auths(&[]);
+    assert!(bridge.try_reclaim_tokens(&token_id, &100i128, &recipient).is_err());
+}
+
+#[test]
+fn test_reclaim_after_fund() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 5i128);
+
+    let recipient = Address::generate(&env);
+    bridge.reclaim_tokens(&token_id, &5i128, &recipient);
+
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &recipient), 5i128);
+}
+
 /********** Minimal Test Token **********/
 
 #[contracttype]

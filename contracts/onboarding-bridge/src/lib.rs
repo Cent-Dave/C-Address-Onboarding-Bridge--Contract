@@ -212,6 +212,27 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    pub fn reclaim_tokens(
+        env: Env,
+        asset: Address,
+        amount: i128,
+        to: Address,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &to, &amount);
+
+        env.events()
+            .publish(("TokensReclaimed", admin, to), (amount, asset));
+        Ok(())
+    }
+
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(read_fee_bps(&env))
