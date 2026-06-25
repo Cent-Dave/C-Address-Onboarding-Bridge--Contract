@@ -1116,3 +1116,19 @@ fn test_query_total_bridged_zero() {
     assert_eq!(total_bridged, 0i128);
     assert_eq!(total_fees, 0i128);
 }
+
+/********** admin state change events tests **********/
+
+#[test]
+fn test_initialize_emits_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
+}

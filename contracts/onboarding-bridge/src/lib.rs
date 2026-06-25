@@ -229,6 +229,8 @@ impl OnboardingBridge {
         save_fee_collector(&env, &fee_collector);
         save_fee_bps(&env, &fee_bps);
         mark_initialized(&env);
+        env.events()
+            .publish(("Initialized", admin.clone(), fee_collector.clone()), (fee_bps,));
         Ok(())
     }
 
