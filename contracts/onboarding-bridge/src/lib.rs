@@ -69,6 +69,14 @@ fn mark_initialized(env: &Env) {
     env.storage().instance().set(&DataKey::Initialized, &true);
 }
 
+fn save_minimum_amount(env: &Env, amount: &i128) {
+    env.storage().instance().set(&DataKey::MinimumAmount, amount);
+}
+
+fn read_minimum_amount(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::MinimumAmount).unwrap_or(0)
+}
+
 fn check_initialized(env: &Env) -> Result<(), BridgeError> {
     if !read_initialized(env) {
         return Err(BridgeError::NotInitialized);
@@ -287,6 +295,22 @@ impl OnboardingBridge {
         admin.require_auth();
         save_admin(&env, &new_admin);
         Ok(())
+    }
+
+    pub fn set_minimum_amount(env: Env, amount: i128) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        save_minimum_amount(&env, &amount);
+        Ok(())
+    }
+
+    pub fn query_minimum_amount(env: Env) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_minimum_amount(&env))
     }
 
     pub fn withdraw_fees(env: Env, asset: Address, amount: i128) -> Result<(), BridgeError> {
