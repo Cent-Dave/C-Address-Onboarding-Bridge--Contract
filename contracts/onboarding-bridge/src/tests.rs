@@ -1156,3 +1156,102 @@ fn test_daily_limit_default_unlimited() {
     
     assert_eq!(check_balance(&env, &token_id, &target), 50000i128);
 }
+
+/********** Asset Fee Cap Tests (Issue #16) **********/
+
+#[test]
+fn test_set_asset_fee_cap() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    
+    bridge.set_asset_fee_cap(&token_id, &250u32).unwrap();
+    
+    let cap = bridge.query_asset_fee_cap(&token_id).unwrap();
+    assert_eq!(cap, 250u32);
+}
+
+#[test]
+fn test_asset_fee_cap_limits_effective_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    
+    bridge.initialize(&admin, &fee_collector, &500u32);
+    bridge.add_asset(&token_id);
+    bridge.set_asset_fee_cap(&token_id, &100u32).unwrap();
+    
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &1000i128).unwrap();
+    
+    let expected_net = 1000i128 - (1000i128 * 100 / 10000);
+    assert_eq!(check_balance(&env, &token_id, &target), expected_net);
+}
+
+#[test]
+fn test_asset_fee_cap_defaults_to_max() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    
+    bridge.initialize(&admin, &fee_collector, &500u32);
+    bridge.add_asset(&token_id);
+    
+    let cap = bridge.query_asset_fee_cap(&token_id).unwrap();
+    assert_eq!(cap, 1000u32);
+    
+    mint_tokens(&env, &token_id, &user, 10000i128);
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &10000i128).unwrap();
+    
+    let expected_net = 10000i128 - (10000i128 * 500 / 10000);
+    assert_eq!(check_balance(&env, &token_id, &target), expected_net);
+}
+
+#[test]
+fn test_asset_fee_cap_cannot_exceed_max() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    
+    assert_eq!(
+        bridge.try_set_asset_fee_cap(&token_id, &2000u32),
+        Err(Ok(BridgeError::FeeTooHigh))
+    );
+}
+
+#[test]
+fn test_multiple_assets_independent_fee_caps() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    
+    bridge.initialize(&admin, &fee_collector, &400u32);
+    bridge.add_asset(&token_id);
+    
+    let token_id2 = Address::generate(&env);
+    bridge.add_asset(&token_id2);
+    
+    bridge.set_asset_fee_cap(&token_id, &100u32).unwrap();
+    bridge.set_asset_fee_cap(&token_id2, &300u32).unwrap();
+    
+    let cap1 = bridge.query_asset_fee_cap(&token_id).unwrap();
+    let cap2 = bridge.query_asset_fee_cap(&token_id2).unwrap();
+    
+    assert_eq!(cap1, 100u32);
+    assert_eq!(cap2, 300u32);
+}

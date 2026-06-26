@@ -417,6 +417,29 @@ impl OnboardingBridge {
         Ok(read_source_daily_limit(&env, &source, &asset))
     }
 
+    pub fn set_asset_fee_cap(
+        env: Env,
+        asset: Address,
+        max_fee_bps: u32,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        if max_fee_bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        save_asset_fee_cap(&env, &asset, max_fee_bps);
+        Ok(())
+    }
+
+    pub fn query_asset_fee_cap(
+        env: Env,
+        asset: Address,
+    ) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_asset_fee_cap(&env, &asset))
+    }
+
     pub fn set_fee_collector(env: Env, new_fee_collector: Address) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
