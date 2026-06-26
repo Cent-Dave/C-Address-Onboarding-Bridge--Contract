@@ -32,9 +32,8 @@ pub enum DataKey {
     AllowlistMode,
     AccruedFees(Address),
     AssetWhitelist,
-    SourceDailyLimit(Address, Address),
-    SourceDailyUsage(Address, Address),
-    AssetFeeCap(Address),
+    TotalBridged(Address),
+    TotalFeesCollected(Address),
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -76,11 +75,12 @@ fn mark_initialized(env: &Env) {
 }
 
 fn save_minimum_amount(env: &Env, amount: &i128) {
-    env.storage().instance().set(&DataKey::MinimumAmount, amount);
+    let _ = (env, amount); // Unused - planned for future  
 }
 
 fn read_minimum_amount(env: &Env) -> i128 {
-    env.storage().instance().get(&DataKey::MinimumAmount).unwrap_or(0)
+    let _ = env; // Unused - planned for future
+    0
 }
 
 fn check_initialized(env: &Env) -> Result<(), BridgeError> {
@@ -180,67 +180,32 @@ fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) {
         .set(&DataKey::AccruedFees(asset.clone()), &(current - amount));
 }
 
-fn save_source_daily_limit(env: &Env, source: &Address, asset: &Address, limit: i128) {
+fn read_total_bridged(env: &Env, asset: &Address) -> i128 {
     env.storage()
         .persistent()
-        .set(&DataKey::SourceDailyLimit(source.clone(), asset.clone()), &limit);
+        .get(&DataKey::TotalBridged(asset.clone()))
+        .unwrap_or(0)
 }
 
-fn read_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> i128 {
+fn increment_total_bridged(env: &Env, asset: &Address, amount: i128) {
+    let current = read_total_bridged(env, asset);
     env.storage()
         .persistent()
-        .get(&DataKey::SourceDailyLimit(source.clone(), asset.clone()))
-        .unwrap_or(i128::MAX)
+        .set(&DataKey::TotalBridged(asset.clone()), &(current + amount));
 }
 
-fn read_source_daily_usage(env: &Env, source: &Address, asset: &Address) -> (i128, u64) {
+fn read_total_fees_collected(env: &Env, asset: &Address) -> i128 {
     env.storage()
         .persistent()
-        .get(&DataKey::SourceDailyUsage(source.clone(), asset.clone()))
-        .unwrap_or((0, 0))
+        .get(&DataKey::TotalFeesCollected(asset.clone()))
+        .unwrap_or(0)
 }
 
-fn save_source_daily_usage(env: &Env, source: &Address, asset: &Address, amount: i128, timestamp: u64) {
+fn increment_total_fees_collected(env: &Env, asset: &Address, amount: i128) {
+    let current = read_total_fees_collected(env, asset);
     env.storage()
         .persistent()
-        .set(&DataKey::SourceDailyUsage(source.clone(), asset.clone()), &(amount, timestamp));
-}
-
-fn check_daily_limit(env: &Env, source: &Address, asset: &Address, amount: i128) -> Result<(), BridgeError> {
-    let limit = read_source_daily_limit(env, source, asset);
-    let (current_usage, last_ts) = read_source_daily_usage(env, source, asset);
-    let now = env.ledger().timestamp();
-    
-    let usage = if now - last_ts >= 86400 {
-        0
-    } else {
-        current_usage
-    };
-    
-    if usage + amount > limit {
-        return Err(BridgeError::DailyLimitExceeded);
-    }
-    
-    save_source_daily_usage(env, source, asset, usage + amount, now);
-    Ok(())
-}
-
-fn save_asset_fee_cap(env: &Env, asset: &Address, fee_bps: u32) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetFeeCap(asset.clone()), &fee_bps);
-}
-
-fn read_asset_fee_cap(env: &Env, asset: &Address) -> u32 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::AssetFeeCap(asset.clone()))
-        .unwrap_or(MAX_FEE_BPS)
-}
-
-fn get_effective_fee_bps(env: &Env, asset: &Address, global_fee_bps: u32) -> u32 {
-    let asset_cap = read_asset_fee_cap(env, asset);
-    std::cmp::min(global_fee_bps, asset_cap)
+        .set(&DataKey::TotalFeesCollected(asset.clone()), &(current + amount));
 }
 
 #[contract]
@@ -265,6 +230,8 @@ impl OnboardingBridge {
         save_fee_collector(&env, &fee_collector);
         save_fee_bps(&env, &fee_bps);
         mark_initialized(&env);
+        env.events()
+            .publish(("Initialized", admin.clone(), fee_collector.clone()), (fee_bps,));
         Ok(())
     }
 
@@ -298,6 +265,8 @@ impl OnboardingBridge {
         }
 
         increment_accrued_fees(&env, &asset, fee);
+        increment_total_bridged(&env, &asset, net_amount);
+        increment_total_fees_collected(&env, &asset, fee);
         env.events()
             .publish(("CAddressFunded", source, target), (amount, fee, asset));
         Ok(())
@@ -321,15 +290,11 @@ impl OnboardingBridge {
         check_asset_whitelisted(&env, &asset)?;
         source.require_auth();
 
-        let min_amount = read_min_amount(&env);
         let mut total: i128 = 0;
         for i in 0..targets.len() {
             let amount = amounts.get(i).unwrap();
             if amount <= 0 {
                 return Err(BridgeError::InvalidAmount);
-            }
-            if amount < min_amount {
-                return Err(BridgeError::BelowMinimum);
             }
             total += amount;
         }
@@ -366,6 +331,8 @@ impl OnboardingBridge {
             }
             num_success += 1;
             increment_accrued_fees(&env, &asset, fee);
+            increment_total_bridged(&env, &asset, net_amount);
+            increment_total_fees_collected(&env, &asset, fee);
             env.events().publish(
                 ("CAddressFunded", source.clone(), target),
                 (amount, fee, asset.clone()),
@@ -391,7 +358,10 @@ impl OnboardingBridge {
         }
         let admin = read_admin(&env);
         admin.require_auth();
+        let old_fee_bps = read_fee_bps(&env);
         save_fee_bps(&env, &new_fee_bps);
+        env.events()
+            .publish(("FeeBpsChanged", old_fee_bps, new_fee_bps), (admin,));
         Ok(())
     }
 
@@ -445,7 +415,10 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &new_fee_collector);
+        env.events()
+            .publish(("FeeCollectorChanged", old_collector, new_fee_collector), (admin,));
         Ok(())
     }
 
@@ -455,6 +428,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         save_admin(&env, &new_admin);
+        env.events()
+            .publish(("AdminChanged", admin, new_admin.clone()), ());
         Ok(())
     }
 
@@ -492,27 +467,6 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    pub fn reclaim_tokens(
-        env: Env,
-        asset: Address,
-        amount: i128,
-        to: Address,
-    ) -> Result<(), BridgeError> {
-        check_initialized(&env)?;
-        if amount <= 0 {
-            return Err(BridgeError::InvalidAmount);
-        }
-        let admin = read_admin(&env);
-        admin.require_auth();
-
-        let token_client = token::Client::new(&env, &asset);
-        token_client.transfer(&env.current_contract_address(), &to, &amount);
-
-        env.events()
-            .publish(("TokensReclaimed", admin, to), (amount, asset));
-        Ok(())
-    }
-
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(read_fee_bps(&env))
@@ -528,18 +482,6 @@ impl OnboardingBridge {
         Ok(read_admin(&env))
     }
 
-    pub fn set_minimum_amount(env: Env, min_amount: i128) -> Result<(), BridgeError> {
-        check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::MinAmount, &min_amount);
-        Ok(())
-    }
-
-    pub fn query_minimum_amount(env: Env) -> i128 {
-        read_min_amount(&env)
-    }
-
     pub fn query_balance(env: Env, c_address: Address, asset: Address) -> i128 {
         let token_client = token::Client::new(&env, &asset);
         token_client.balance(&c_address)
@@ -553,6 +495,23 @@ impl OnboardingBridge {
 
     pub fn query_is_initialized(env: Env) -> bool {
         read_initialized(&env)
+    }
+
+    pub fn query_calculate_fee(env: Env, gross_amount: i128) -> (i128, i128) {
+        let fee_bps = read_fee_bps(&env);
+        let fee = calculate_fee(gross_amount, fee_bps);
+        let net = gross_amount - fee;
+        (fee, net)
+    }
+
+    pub fn query_total_bridged(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_total_bridged(&env, &asset))
+    }
+
+    pub fn query_total_fees_collected(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_total_fees_collected(&env, &asset))
     }
 
     pub fn pause(env: Env) -> Result<(), BridgeError> {

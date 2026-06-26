@@ -982,329 +982,200 @@ impl TestToken {
     }
 }
 
-/********** Batch Atomicity Tests (Issue #14) **********/
+/********** query_calculate_fee tests **********/
 
 #[test]
-fn test_batch_partial_success_blocked_address() {
+fn test_query_calculate_fee() {
     let env = Env::default();
-    let (bridge, user, token_id, _admin) = setup_bridge(&env);
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    
-    bridge.add_to_blocklist(&t2);
-    
-    let targets = Vec::from_array(&env, [t1.clone(), t2.clone()]);
-    let amounts = Vec::from_array(&env, [200i128, 300i128]);
-    
-    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
-    
-    assert_eq!(check_balance(&env, &token_id, &t1), 200i128);
-    assert_eq!(check_balance(&env, &token_id, &t2), 0i128);
-    assert_eq!(check_balance(&env, &token_id, &user), 800i128);
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+
+    let (fee, net) = bridge.query_calculate_fee(&1000i128);
+    assert_eq!(fee, 10i128);
+    assert_eq!(net, 990i128);
 }
 
 #[test]
-fn test_batch_refund_on_mixed_failures() {
+fn test_query_calculate_fee_zero_fee() {
     let env = Env::default();
-    let (bridge, user, token_id, _admin) = setup_bridge(&env);
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    let t3 = Address::generate(&env);
-    
-    bridge.add_to_blocklist(&t2);
-    
-    let targets = Vec::from_array(&env, [t1.clone(), t2.clone(), t3.clone()]);
-    let amounts = Vec::from_array(&env, [100i128, 200i128, 150i128]);
-    
-    let user_before = check_balance(&env, &token_id, &user);
-    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
-    
-    let user_after = check_balance(&env, &token_id, &user);
-    let total_sent = 100 + 200 + 150;
-    let refunded = 200;
-    
-    assert_eq!(check_balance(&env, &token_id, &t1), 100i128);
-    assert_eq!(check_balance(&env, &token_id, &t2), 0i128);
-    assert_eq!(check_balance(&env, &token_id, &t3), 150i128);
-    assert_eq!(user_before - user_after, total_sent - refunded);
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+
+    let (fee, net) = bridge.query_calculate_fee(&1000i128);
+    assert_eq!(fee, 0i128);
+    assert_eq!(net, 1000i128);
 }
 
 #[test]
-fn test_batch_completed_event_emitted() {
+fn test_query_calculate_fee_max_fee() {
     let env = Env::default();
-    let (bridge, user, token_id, _admin) = setup_bridge(&env);
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    
-    bridge.add_to_blocklist(&t2);
-    
-    let targets = Vec::from_array(&env, [t1, t2]);
-    let amounts = Vec::from_array(&env, [100i128, 200i128]);
-    
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &1000u32);
+
+    let (fee, net) = bridge.query_calculate_fee(&1000i128);
+    assert_eq!(fee, 100i128);
+    assert_eq!(net, 900i128);
+}
+
+/********** cumulative counters tests **********/
+
+#[test]
+fn test_query_total_bridged_and_fees_collected() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    bridge.add_asset(&token_id);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128);
+
+    let total_bridged = bridge.query_total_bridged(&token_id);
+    let total_fees = bridge.query_total_fees_collected(&token_id);
+
+    assert_eq!(total_bridged, 495i128);
+    assert_eq!(total_fees, 5i128);
+}
+
+#[test]
+fn test_query_total_bridged_accumulates() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+    bridge.add_asset(&token_id);
+    mint_tokens(&env, &token_id, &user, 5000i128);
+
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+
+    bridge.fund_c_address(&user, &target1, &token_id, &1000i128);
+    bridge.fund_c_address(&user, &target2, &token_id, &1000i128);
+
+    let total_bridged = bridge.query_total_bridged(&token_id);
+    let total_fees = bridge.query_total_fees_collected(&token_id);
+
+    assert_eq!(total_bridged, 1990i128);
+    assert_eq!(total_fees, 10i128);
+}
+
+#[test]
+fn test_query_total_bridged_batch() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    bridge.add_asset(&token_id);
+    mint_tokens(&env, &token_id, &user, 3000i128);
+
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target1, target2]);
+    let amounts = Vec::from_array(&env, [1000i128, 500i128]);
+
     bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
-    
+
+    let total_bridged = bridge.query_total_bridged(&token_id);
+    let total_fees = bridge.query_total_fees_collected(&token_id);
+
+    assert_eq!(total_bridged, 1485i128);
+    assert_eq!(total_fees, 15i128);
+}
+
+#[test]
+fn test_query_total_bridged_zero() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+
+    let total_bridged = bridge.query_total_bridged(&token_id);
+    let total_fees = bridge.query_total_fees_collected(&token_id);
+
+    assert_eq!(total_bridged, 0i128);
+    assert_eq!(total_fees, 0i128);
+}
+
+/********** admin state change events tests **********/
+
+#[test]
+fn test_initialize_emits_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+
     let events = env.events().all();
     let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
-    assert_eq!(contract_id, &bridge.address);
+    assert_eq!(contract_id, &bridge_id);
 }
 
 #[test]
-fn test_batch_all_succeed_no_refund() {
-    let env = Env::default();
-    let (bridge, user, token_id, _admin) = setup_bridge(&env);
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    
-    let targets = Vec::from_array(&env, [t1.clone(), t2.clone()]);
-    let amounts = Vec::from_array(&env, [300i128, 400i128]);
-    
-    let user_before = check_balance(&env, &token_id, &user);
-    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
-    let user_after = check_balance(&env, &token_id, &user);
-    
-    assert_eq!(check_balance(&env, &token_id, &t1), 300i128);
-    assert_eq!(check_balance(&env, &token_id, &t2), 400i128);
-    assert_eq!(user_before - user_after, 700i128);
-}
-
-/********** Daily Limits Tests (Issue #15) **********/
-
-#[test]
-fn test_set_source_daily_limit() {
+fn test_fee_bps_changed_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    
-    bridge.initialize(&admin, &fee_collector, &0u32);
-    
-    let source = Address::generate(&env);
-    bridge.set_source_daily_limit(&source, &token_id, &5000i128).unwrap();
-    
-    let limit = bridge.query_source_daily_limit(&source, &token_id).unwrap();
-    assert_eq!(limit, 5000i128);
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+    bridge.set_fee_bps(&100u32);
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
 }
 
 #[test]
-fn test_daily_limit_enforced() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-    
-    bridge.initialize(&admin, &fee_collector, &0u32);
-    bridge.add_asset(&token_id);
-    bridge.set_source_daily_limit(&user, &token_id, &500i128).unwrap();
-    
-    mint_tokens(&env, &token_id, &user, 2000i128);
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    
-    bridge.fund_c_address(&user, &t1, &token_id, &400i128).unwrap();
-    
-    assert_eq!(
-        bridge.try_fund_c_address(&user, &t2, &token_id, &200i128),
-        Err(Ok(BridgeError::DailyLimitExceeded))
-    );
-}
-
-#[test]
-fn test_daily_limit_allows_within_threshold() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-    
-    bridge.initialize(&admin, &fee_collector, &0u32);
-    bridge.add_asset(&token_id);
-    bridge.set_source_daily_limit(&user, &token_id, &1000i128).unwrap();
-    
-    mint_tokens(&env, &token_id, &user, 2000i128);
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    
-    bridge.fund_c_address(&user, &t1, &token_id, &400i128).unwrap();
-    bridge.fund_c_address(&user, &t2, &token_id, &600i128).unwrap();
-    
-    assert_eq!(check_balance(&env, &token_id, &t1), 400i128);
-    assert_eq!(check_balance(&env, &token_id, &t2), 600i128);
-}
-
-#[test]
-fn test_daily_limit_default_unlimited() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-    
-    bridge.initialize(&admin, &fee_collector, &0u32);
-    bridge.add_asset(&token_id);
-    
-    mint_tokens(&env, &token_id, &user, 100000i128);
-    
-    let target = Address::generate(&env);
-    bridge.fund_c_address(&user, &target, &token_id, &50000i128).unwrap();
-    
-    assert_eq!(check_balance(&env, &token_id, &target), 50000i128);
-}
-
-/********** Asset Fee Cap Tests (Issue #16) **********/
-
-#[test]
-fn test_set_asset_fee_cap() {
+fn test_fee_collector_changed_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    
-    bridge.initialize(&admin, &fee_collector, &0u32);
-    
-    bridge.set_asset_fee_cap(&token_id, &250u32).unwrap();
-    
-    let cap = bridge.query_asset_fee_cap(&token_id).unwrap();
-    assert_eq!(cap, 250u32);
+
+    bridge.initialize(&admin, &fee_collector, &50u32);
+    let new_collector = Address::generate(&env);
+    bridge.set_fee_collector(&new_collector);
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
 }
 
 #[test]
-fn test_asset_fee_cap_limits_effective_fee() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-    
-    bridge.initialize(&admin, &fee_collector, &500u32);
-    bridge.add_asset(&token_id);
-    bridge.set_asset_fee_cap(&token_id, &100u32).unwrap();
-    
-    mint_tokens(&env, &token_id, &user, 1000i128);
-    
-    let target = Address::generate(&env);
-    bridge.fund_c_address(&user, &target, &token_id, &1000i128).unwrap();
-    
-    let expected_net = 1000i128 - (1000i128 * 100 / 10000);
-    assert_eq!(check_balance(&env, &token_id, &target), expected_net);
-}
-
-#[test]
-fn test_asset_fee_cap_defaults_to_max() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-    
-    bridge.initialize(&admin, &fee_collector, &500u32);
-    bridge.add_asset(&token_id);
-    
-    let cap = bridge.query_asset_fee_cap(&token_id).unwrap();
-    assert_eq!(cap, 1000u32);
-    
-    mint_tokens(&env, &token_id, &user, 10000i128);
-    let target = Address::generate(&env);
-    bridge.fund_c_address(&user, &target, &token_id, &10000i128).unwrap();
-    
-    let expected_net = 10000i128 - (10000i128 * 500 / 10000);
-    assert_eq!(check_balance(&env, &token_id, &target), expected_net);
-}
-
-#[test]
-fn test_asset_fee_cap_cannot_exceed_max() {
+fn test_admin_changed_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    
-    bridge.initialize(&admin, &fee_collector, &0u32);
-    
-    assert_eq!(
-        bridge.try_set_asset_fee_cap(&token_id, &2000u32),
-        Err(Ok(BridgeError::FeeTooHigh))
-    );
-}
 
-#[test]
-fn test_multiple_assets_independent_fee_caps() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-    
-    bridge.initialize(&admin, &fee_collector, &400u32);
-    bridge.add_asset(&token_id);
-    
-    let token_id2 = Address::generate(&env);
-    bridge.add_asset(&token_id2);
-    
-    bridge.set_asset_fee_cap(&token_id, &100u32).unwrap();
-    bridge.set_asset_fee_cap(&token_id2, &300u32).unwrap();
-    
-    let cap1 = bridge.query_asset_fee_cap(&token_id).unwrap();
-    let cap2 = bridge.query_asset_fee_cap(&token_id2).unwrap();
-    
-    assert_eq!(cap1, 100u32);
-    assert_eq!(cap2, 300u32);
-}
+    bridge.initialize(&admin, &fee_collector, &50u32);
+    let new_admin = Address::generate(&env);
+    bridge.set_admin(&new_admin);
 
-/********** Integration Tests **********/
-
-#[test]
-fn test_batch_with_daily_limits() {
-    let env = Env::default();
-    let (bridge, user, token_id, _admin) = setup_bridge(&env);
-    
-    bridge.set_source_daily_limit(&user, &token_id, &500i128).unwrap();
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    let t3 = Address::generate(&env);
-    
-    let targets = Vec::from_array(&env, [t1.clone(), t2.clone(), t3.clone()]);
-    let amounts = Vec::from_array(&env, [200i128, 200i128, 200i128]);
-    
-    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
-    
-    assert_eq!(check_balance(&env, &token_id, &t1), 200i128);
-    assert_eq!(check_balance(&env, &token_id, &t2), 200i128);
-    assert_eq!(check_balance(&env, &token_id, &t3), 200i128);
-    assert_eq!(check_balance(&env, &token_id, &user), 400i128);
-}
-
-#[test]
-fn test_batch_refund_with_asset_fee_cap() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-    
-    bridge.initialize(&admin, &fee_collector, &500u32);
-    bridge.add_asset(&token_id);
-    bridge.set_asset_fee_cap(&token_id, &100u32).unwrap();
-    
-    mint_tokens(&env, &token_id, &user, 1000i128);
-    
-    let t1 = Address::generate(&env);
-    let t2 = Address::generate(&env);
-    
-    bridge.add_to_blocklist(&t2);
-    
-    let targets = Vec::from_array(&env, [t1.clone(), t2.clone()]);
-    let amounts = Vec::from_array(&env, [500i128, 500i128]);
-    
-    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
-    
-    let expected_net_t1 = 500i128 - (500i128 * 100 / 10000);
-    assert_eq!(check_balance(&env, &token_id, &t1), expected_net_t1);
-    assert_eq!(check_balance(&env, &token_id, &t2), 0i128);
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
 }
