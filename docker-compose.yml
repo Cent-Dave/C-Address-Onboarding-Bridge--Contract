@@ -1,0 +1,88 @@
+version: '3.9'
+
+services:
+  # -------------------------------------------------------------------
+  # Relayer API — TypeScript with ts-node-dev hot reload
+  # -------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/sdk/node_modules
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://bridge:bridge@postgres:5432/bridge
+      REDIS_URL: redis://redis:6379
+      STELLAR_RPC_URL: http://soroban:8000/soroban/rpc
+      NETWORK_PASSPHRASE: Standalone Network ; February 2017
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      soroban:
+        condition: service_healthy
+    command: npx ts-node-dev --respawn --transpile-only relayer/index.ts
+
+  # -------------------------------------------------------------------
+  # PostgreSQL — event store and reconciliation DB
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: bridge
+      POSTGRES_DB: bridge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U bridge']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------
+  # Redis — nonce deduplication cache and job queue
+  # -------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------
+  # Soroban Quickstart — local Stellar + Soroban sandbox
+  # -------------------------------------------------------------------
+  soroban:
+    image: stellar/quickstart:latest
+    ports:
+      - '8000:8000'   # Horizon + Soroban RPC
+    environment:
+      STELLAR_NETWORK: local
+      ENABLE_SOROBAN_RPC: 'true'
+    command: --local --enable-soroban-rpc
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:8000/soroban/rpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}" -H "Content-Type: application/json" | grep -q healthy']
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  postgres_data:
+  redis_data:
