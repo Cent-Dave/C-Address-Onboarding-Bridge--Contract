@@ -20,6 +20,7 @@ pub enum BridgeError {
     DailyLimitExceeded = 11,
 
     DuplicateNonce = 12,
+    TransactionExpired = 13,
 }
 
 #[contracttype]
@@ -310,9 +311,15 @@ impl OnboardingBridge {
         asset: Address,
         amount: i128,
         nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
+        if let Some(d) = deadline {
+            if env.ledger().timestamp() > d {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -349,9 +356,15 @@ impl OnboardingBridge {
         amounts: Vec<i128>,
         asset: Address,
         nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
+        if let Some(d) = deadline {
+            if env.ledger().timestamp() > d {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
         if targets.len() != amounts.len() {
             return Err(BridgeError::MismatchedArrays);
         }
