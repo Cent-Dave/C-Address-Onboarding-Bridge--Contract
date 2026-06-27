@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+set -e
+
+echo "▶ pre-commit: running checks..."
+
+# ---- TypeScript type-check ----
+echo "  [1/3] tsc type-check"
+(cd sdk && npx tsc --noEmit)
+
+# ---- ESLint (staged TS files only) ----
+STAGED_TS=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(ts|tsx)$' || true)
+if [ -n "$STAGED_TS" ]; then
+  echo "  [2/3] eslint"
+  (cd sdk && npx eslint --max-warnings=0 $STAGED_TS)
+else
+  echo "  [2/3] eslint (no staged .ts files — skipped)"
+fi
+
+# ---- Rust fmt check (if .rs files staged) ----
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.rs$' || true)
+if [ -n "$STAGED_RS" ]; then
+  echo "  [3/3] cargo fmt --check"
+  cargo fmt -p onboarding-bridge -- --check
+else
+  echo "  [3/3] cargo fmt (no staged .rs files — skipped)"
+fi
+
+echo "✔ pre-commit passed"
