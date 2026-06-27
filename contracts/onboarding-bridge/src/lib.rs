@@ -18,6 +18,10 @@ pub enum BridgeError {
     InsufficientReclaimable = 9,
     AssetNotWhitelisted = 10,
     DailyLimitExceeded = 11,
+    TimelockNotFound = 12,
+    TimelockNotMatured = 13,
+    Unauthorized = 14,
+    InvalidReleaseTime = 15,
 }
 
 #[contracttype]
@@ -34,6 +38,20 @@ pub enum DataKey {
     AssetWhitelist,
     TotalBridged(Address),
     TotalFeesCollected(Address),
+    TimelockEntry(u64),
+    TimelockCounter,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockEntry {
+    pub source: Address,
+    pub target: Address,
+    pub asset: Address,
+    pub amount: i128,       // gross amount (fee already deducted at claim time)
+    pub release_time: u64,
+    pub cliff_time: u64,
+    pub claimed: bool,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -206,6 +224,30 @@ fn increment_total_fees_collected(env: &Env, asset: &Address, amount: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::TotalFeesCollected(asset.clone()), &(current + amount));
+}
+
+fn next_timelock_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TimelockCounter)
+        .unwrap_or(0u64);
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockCounter, &(id + 1));
+    id
+}
+
+fn save_timelock_entry(env: &Env, id: u64, entry: &TimelockEntry) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::TimelockEntry(id), entry);
+}
+
+fn read_timelock_entry(env: &Env, id: u64) -> Option<TimelockEntry> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TimelockEntry(id))
 }
 
 #[contract]
@@ -674,6 +716,101 @@ impl OnboardingBridge {
     pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).keys())
+    }
+
+    // --- Timelocked Funding ---
+
+    pub fn fund_c_address_timelocked(
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        release_time: u64,
+        cliff_time: u64,
+    ) -> Result<u64, BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let now = env.ledger().timestamp();
+        if release_time <= now {
+            return Err(BridgeError::InvalidReleaseTime);
+        }
+        if cliff_time > 0 && cliff_time > release_time {
+            return Err(BridgeError::InvalidReleaseTime);
+        }
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+        source.require_auth();
+
+        token::Client::new(&env, &asset)
+            .transfer(&source, &env.current_contract_address(), &amount);
+
+        let id = next_timelock_id(&env);
+        save_timelock_entry(
+            &env,
+            id,
+            &TimelockEntry {
+                source: source.clone(),
+                target: target.clone(),
+                asset: asset.clone(),
+                amount,
+                release_time,
+                cliff_time,
+                claimed: false,
+            },
+        );
+
+        env.events().publish(
+            ("TimelockCreated", source, target),
+            (id, amount, asset, release_time, cliff_time),
+        );
+        Ok(id)
+    }
+
+    pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        let mut entry = read_timelock_entry(&env, id)
+            .ok_or(BridgeError::TimelockNotFound)?;
+
+        entry.target.require_auth();
+
+        if env.ledger().timestamp() < entry.release_time {
+            return Err(BridgeError::TimelockNotMatured);
+        }
+        if entry.claimed {
+            return Err(BridgeError::Unauthorized);
+        }
+
+        entry.claimed = true;
+        save_timelock_entry(&env, id, &entry);
+
+        let fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, fee_bps);
+        let fee = calculate_fee(entry.amount, effective_fee_bps);
+        let net_amount = entry.amount - fee;
+
+        let token_client = token::Client::new(&env, &entry.asset);
+        if net_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &entry.target, &net_amount);
+        }
+        increment_accrued_fees(&env, &entry.asset, fee);
+        increment_total_bridged(&env, &entry.asset, net_amount);
+        increment_total_fees_collected(&env, &entry.asset, fee);
+
+        env.events().publish(
+            ("TimelockClaimed", entry.target),
+            (id, net_amount, fee, entry.asset),
+        );
+        Ok(())
+    }
+
+    pub fn query_timelocked(env: Env, id: u64) -> Result<TimelockEntry, BridgeError> {
+        read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)
     }
 }
 
