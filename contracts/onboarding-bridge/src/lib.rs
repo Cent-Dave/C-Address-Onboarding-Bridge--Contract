@@ -156,8 +156,19 @@ fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
     Ok(())
 }
 
+#[inline(always)]
 fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
-    (amount * fee_bps as i128) / FEE_DENOMINATOR
+    if fee_bps == 0 {
+        return 0;
+    }
+    let bps = fee_bps as i128;
+    // Use checked arithmetic to guard against overflow on very large amounts.
+    // If checked_mul overflows i128 (amount > ~1.7e38 / 1000), fall back to
+    // dividing first at the cost of minor precision loss.
+    match amount.checked_mul(bps) {
+        Some(product) => product / FEE_DENOMINATOR,
+        None => (amount / FEE_DENOMINATOR) * bps,
+    }
 }
 
 fn is_blocked(env: &Env, addr: &Address) -> bool {
@@ -442,8 +453,11 @@ fn read_asset_fee_cap(env: &Env, asset: &Address) -> u32 {
         .unwrap_or(MAX_FEE_BPS)
 }
 
-/// Returns the effective fee bps for an asset, capped by its per-asset fee cap.
+#[inline(always)]
 fn get_effective_fee_bps(env: &Env, asset: &Address, global_fee_bps: u32) -> u32 {
+    if global_fee_bps == 0 {
+        return 0;
+    }
     let cap = read_asset_fee_cap(env, asset);
     global_fee_bps.min(cap)
 }
@@ -554,7 +568,13 @@ impl OnboardingBridge {
         save_admin(&env, &admin);
         save_fee_collector(&env, &fee_collector);
         save_fee_bps(&env, &fee_bps);
+        save_bridge_config(&env, &BridgeConfigData {
+            admin: admin.clone(),
+            fee_collector: fee_collector.clone(),
+            fee_bps,
+        });
         mark_initialized(&env);
+        extend_instance_ttl(&env);
         env.events()
             .publish(("Initialized", admin.clone(), fee_collector.clone()), (fee_bps,));
         Ok(())
@@ -586,7 +606,8 @@ impl OnboardingBridge {
         consume_nonce(&env, &source, nonce)?;
 
         let token_client = token::Client::new(&env, &asset);
-        token_client.transfer(&source, &env.current_contract_address(), &amount);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &amount);
 
         let global_fee_bps = read_fee_bps(&env);
         let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
@@ -595,9 +616,10 @@ impl OnboardingBridge {
         let net_amount = amount - fee;
 
         if net_amount > 0 {
-            token_client.transfer(&env.current_contract_address(), &target, &net_amount);
+            token_client.transfer(&contract_addr, &target, &net_amount);
         }
 
+        increment_user_deposit(&env, &source, &asset, amount);
         increment_accrued_fees(&env, &asset, fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
@@ -652,6 +674,10 @@ impl OnboardingBridge {
         let fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, fee_bps);
         let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &total);
+
+        let config = read_bridge_config(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, config.fee_bps);
         let mut num_success = 0u32;
         let mut num_failures = 0u32;
         let mut refund_amount = 0i128;
@@ -723,13 +749,15 @@ impl OnboardingBridge {
         if new_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
         }
-        let admin = read_admin(&env);
-        admin.require_auth();
-        consume_nonce(&env, &admin, nonce)?;
-        let old_fee_bps = read_fee_bps(&env);
+        let mut config = read_bridge_config(&env);
+        config.admin.require_auth();
+        consume_nonce(&env, &config.admin, nonce)?;
+        let old_fee_bps = config.fee_bps;
+        config.fee_bps = new_fee_bps;
         save_fee_bps(&env, &new_fee_bps);
+        save_bridge_config(&env, &config);
         env.events()
-            .publish(("FeeBpsChanged", old_fee_bps, new_fee_bps), (admin,));
+            .publish(("FeeBpsChanged", old_fee_bps, new_fee_bps), (config.admin,));
         Ok(())
     }
 
@@ -785,25 +813,30 @@ impl OnboardingBridge {
     pub fn set_fee_collector(env: Env, new_fee_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
-        consume_nonce(&env, &admin, nonce)?;
-        let old_collector = read_fee_collector(&env);
+        let mut config = read_bridge_config(&env);
+        config.admin.require_auth();
+        consume_nonce(&env, &config.admin, nonce)?;
+        let old_collector = config.fee_collector.clone();
+        config.fee_collector = new_fee_collector.clone();
         save_fee_collector(&env, &new_fee_collector);
+        save_bridge_config(&env, &config);
         env.events()
-            .publish(("FeeCollectorChanged", old_collector, new_fee_collector), (admin,));
+            .publish(("FeeCollectorChanged", old_collector, new_fee_collector), (config.admin,));
         Ok(())
     }
 
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
-        consume_nonce(&env, &admin, nonce)?;
+        let mut config = read_bridge_config(&env);
+        let old_admin = config.admin.clone();
+        config.admin.require_auth();
+        consume_nonce(&env, &config.admin, nonce)?;
+        config.admin = new_admin.clone();
         save_admin(&env, &new_admin);
+        save_bridge_config(&env, &config);
         env.events()
-            .publish(("AdminChanged", admin, new_admin.clone()), ());
+            .publish(("AdminChanged", old_admin, new_admin.clone()), ());
         Ok(())
     }
 
