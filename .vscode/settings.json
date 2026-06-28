@@ -1,0 +1,47 @@
+{
+  // --- Editor ---
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "editor.tabSize": 2,
+  "editor.rulers": [100],
+
+  // --- TypeScript ---
+  "typescript.tsdk": "sdk/node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+
+  // --- Rust ---
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+  "rust-analyzer.cargo.features": ["testutils"],
+  "rust-analyzer.checkOnSave": true,
+  "rust-analyzer.check.command": "clippy",
+
+  // --- Files ---
+  "files.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/target": true,
+    "**/.DS_Store": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/target": true,
+    "**/Cargo.lock": true
+  },
+
+  // --- Docker ---
+  "docker.defaultRegistryPath": "ghcr.io",
+
+  // --- Misc ---
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true
+}

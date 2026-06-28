@@ -3,8 +3,15 @@ import {
   FundCOptions,
   BatchFundCOptions,
   WithdrawFeesOptions,
+  UpgradeOptions,
+  ReclaimTokensOptions,
   TransactionResult,
+  CrossChainFundOptions,
+  RelayerManagementOptions,
+  CreateCOptions,
+  CreateCAddressResult,
 } from './types';
+import { assertAccountAddress, assertContractAddress } from './validate';
 import {
   SorobanRpc,
   Contract,
@@ -15,7 +22,6 @@ import {
   scValToNative,
   TransactionBuilder,
   BASE_FEE,
-  Networks,
 } from '@stellar/stellar-sdk';
 
 export class OnboardingBridgeSDK {
@@ -25,6 +31,7 @@ export class OnboardingBridgeSDK {
   private networkPassphrase: string;
 
   constructor(config: BridgeConfig) {
+    assertContractAddress(config.contractId, 'contractId');
     this.config = config;
     this.contract = new Contract(config.contractId);
     this.provider = new SorobanRpc.Server(config.rpcUrl);
@@ -40,6 +47,9 @@ export class OnboardingBridgeSDK {
     sourceKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(options.source, 'source');
+      assertContractAddress(options.target, 'target');
+      assertContractAddress(options.asset, 'asset');
       const sourceAccount = await this.provider.getAccount(options.source);
 
       const tx = new TransactionBuilder(sourceAccount, {
@@ -86,6 +96,9 @@ export class OnboardingBridgeSDK {
     sourceKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(options.source, 'source');
+      options.targets.forEach((t, i) => assertContractAddress(t, `targets[${i}]`));
+      assertContractAddress(options.asset, 'asset');
       const sourceAccount = await this.provider.getAccount(options.source);
 
       const tx = new TransactionBuilder(sourceAccount, {
@@ -133,6 +146,7 @@ export class OnboardingBridgeSDK {
     feeCollectorKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertContractAddress(options.asset, 'asset');
       const feeCollectorAccount = await this.provider.getAccount(
         feeCollectorKeypair.publicKey(),
       );
@@ -152,6 +166,51 @@ export class OnboardingBridgeSDK {
 
       const preparedTx = await this.provider.prepareTransaction(tx);
       preparedTx.sign(feeCollectorKeypair);
+
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return {
+        hash: response.hash,
+        status: response.status === 'ERROR' ? 'failed' : 'pending',
+      };
+    } catch (error: any) {
+      return {
+        hash: '',
+        status: 'failed',
+        error: error.message || 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Reclaim tokens accidentally sent to the contract (admin only).
+   */
+  async reclaimTokens(
+    options: ReclaimTokensOptions,
+    adminKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      assertContractAddress(options.asset, 'asset');
+      assertAccountAddress(options.to, 'to');
+      const adminAccount = await this.provider.getAccount(
+        adminKeypair.publicKey(),
+      );
+
+      const tx = new TransactionBuilder(adminAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'reclaim_tokens',
+            ...this.toScVals([options.asset, options.amount, options.to]),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
 
       const response = await this.provider.sendTransaction(preparedTx);
 
@@ -226,6 +285,8 @@ export class OnboardingBridgeSDK {
     cAddress: string,
     asset: string,
   ): Promise<string> {
+    assertContractAddress(cAddress, 'cAddress');
+    assertContractAddress(asset, 'asset');
     const result = await this.provider
       .simulateTransaction(
         this.buildSimulationTx('query_balance', [cAddress, asset]),
@@ -237,6 +298,50 @@ export class OnboardingBridgeSDK {
 
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? scValToNative(scVal).toString() : '0';
+  }
+
+  /**
+   * Get the fee balance held by the contract for a given asset.
+   */
+  async getFeeBalance(asset: string): Promise<string> {
+    assertContractAddress(asset, 'asset');
+    const result = await this.provider
+      .simulateTransaction(
+        this.buildSimulationTx('query_fee_balance', [asset]),
+      );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get fee balance: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? scValToNative(scVal).toString() : '0';
+  }
+
+  /**
+   * Get all token balances held by the contract for the given assets.
+   * Returns a map of asset address → balance string.
+   */
+  async getAllBalances(assets: string[]): Promise<Record<string, string>> {
+    assets.forEach((a, i) => assertContractAddress(a, `assets[${i}]`));
+    const result = await this.provider
+      .simulateTransaction(
+        this.buildSimulationTx('query_all_balances', [assets]),
+      );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get all balances: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return {};
+
+    const native = scValToNative(scVal) as Map<string, bigint>;
+    const out: Record<string, string> = {};
+    native.forEach((value, key) => {
+      out[key] = value.toString();
+    });
+    return out;
   }
 
   /**
@@ -307,6 +412,7 @@ export class OnboardingBridgeSDK {
     adminKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(newFeeCollector, 'newFeeCollector');
       const adminAccount = await this.provider.getAccount(
         adminKeypair.publicKey(),
       );
@@ -350,6 +456,7 @@ export class OnboardingBridgeSDK {
     adminKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(newAdmin, 'newAdmin');
       const adminAccount = await this.provider.getAccount(
         adminKeypair.publicKey(),
       );
@@ -386,6 +493,273 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Upgrade the contract to a new wasm implementation (admin only).
+   * The new_wasm_hash must reference wasm already uploaded to the network.
+   * Preserves all instance storage (admin, fee settings, etc.).
+   */
+  async upgrade(
+    options: UpgradeOptions,
+    adminKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(
+        adminKeypair.publicKey(),
+      );
+
+      const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
+      const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
+
+      const tx = new TransactionBuilder(adminAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call('upgrade', wasmHashScVal),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return {
+        hash: response.hash,
+        status: response.status === 'PENDING' ? 'success' : 'pending',
+      };
+    } catch (error: any) {
+      return {
+        hash: '',
+        status: 'failed',
+        error: error.message || 'Unknown error',
+      };
+    }
+  }
+
+  // --- Cross-chain methods ---
+
+  /**
+   * Fund a C-address from a cross-chain event (called by the relayer service).
+   * Requires at least `threshold` valid relayer signatures over the canonical payload hash.
+   */
+  async fundCrosschain(
+    options: CrossChainFundOptions,
+    relayerKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      const relayerAccount = await this.provider.getAccount(relayerKeypair.publicKey());
+
+      const sigsScVal = xdr.ScVal.scvVec(
+        options.sigs.map((s) => {
+          const pubkeyBytes = Buffer.from(s.pubkey, 'hex');
+          const sigBytes = Buffer.from(s.signature, 'hex');
+          return xdr.ScVal.scvMap([
+            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('pubkey'), val: xdr.ScVal.scvBytes(pubkeyBytes) }),
+            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('signature'), val: xdr.ScVal.scvBytes(sigBytes) }),
+          ]);
+        }),
+      );
+
+      const txHashBytes = Buffer.from(options.txHash.replace('0x', ''), 'hex');
+
+      const tx = new TransactionBuilder(relayerAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'fund_c_address_crosschain',
+            nativeToScVal(options.chainId, { type: 'u32' }),
+            xdr.ScVal.scvBytes(txHashBytes),
+            new Address(options.target).toScVal(),
+            new Address(options.asset).toScVal(),
+            nativeToScVal(BigInt(options.amount), { type: 'i128' }),
+            sigsScVal,
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(relayerKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Register an Ed25519 relayer pubkey (admin only). */
+  async addRelayer(options: RelayerManagementOptions, adminKeypair: any): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
+      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+        .addOperation(this.contract.call('add_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+        .setTimeout(30)
+        .build();
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Remove an Ed25519 relayer pubkey (admin only). */
+  async removeRelayer(options: RelayerManagementOptions, adminKeypair: any): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
+      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+        .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+        .setTimeout(30)
+        .build();
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Set the M-of-N relayer threshold (admin only). Must not exceed total relayer count. */
+  async setRelayerThreshold(threshold: number, adminKeypair: any): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
+      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+        .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
+        .setTimeout(30)
+        .build();
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+      const response = await this.provider.sendTransaction(preparedTx);
+      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+    }
+  }
+
+  /** Query the current relayer threshold (M in M-of-N). */
+  async queryRelayerThreshold(): Promise<number> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_relayer_threshold', []),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query relayer threshold: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Number(scValToNative(scVal)) : 0;
+  }
+
+  /**
+   * Create a new C-address (smart contract account) using Soroban's create_contract.
+   * Optionally funds the C-address immediately after creation.
+   */
+  async createCAddress(
+    options: CreateCOptions,
+  ): Promise<CreateCAddressResult> {
+    const deployerKeypair = options.deployerKeypair;
+    const deployerAccount = await this.provider.getAccount(
+      deployerKeypair.publicKey(),
+    );
+
+    const saltBytes = options.salt
+      ? Buffer.from(options.salt, 'hex')
+      : Buffer.from(
+          Array.from({ length: 32 }, () =>
+            Math.floor(Math.random() * 256),
+          ),
+        );
+    const saltScVal = xdr.ScVal.scvBytes(saltBytes);
+
+    const deployerAddress = new Address(deployerKeypair.publicKey());
+
+    const txBuilder = new TransactionBuilder(deployerAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    });
+
+    txBuilder.addOperation(
+      this.contract.call(
+        'create_contract',
+        deployerAddress.toScVal(),
+        saltScVal,
+      ),
+    );
+
+    const deployTx = txBuilder.setTimeout(30).build();
+    const preparedDeployTx = await this.provider.prepareTransaction(deployTx);
+    preparedDeployTx.sign(deployerKeypair);
+
+    const deployResponse = await this.provider.sendTransaction(preparedDeployTx);
+    if (deployResponse.status === 'ERROR') {
+      throw new Error(`Failed to create C-address: ${deployResponse.status}`);
+    }
+
+    let txResult = await this.provider.getTransaction(deployResponse.hash);
+    while (txResult.status === 'NOT_FOUND') {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      txResult = await this.provider.getTransaction(deployResponse.hash);
+    }
+
+    if (txResult.status !== 'SUCCESS') {
+      throw new Error(`C-address creation failed: ${txResult.status}`);
+    }
+
+    const returnVal = (txResult as any).returnValue;
+    const cAddress: string = returnVal
+      ? scValToNative(returnVal).toString()
+      : '';
+
+    if (options.initialFunds && cAddress) {
+      const fundAccount = await this.provider.getAccount(
+        deployerKeypair.publicKey(),
+      );
+      const fundTx = new TransactionBuilder(fundAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'fund_c_address',
+            ...this.toScVals([
+              deployerKeypair.publicKey(),
+              cAddress,
+              options.initialFunds.asset,
+              options.initialFunds.amount,
+            ]),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedFundTx = await this.provider.prepareTransaction(fundTx);
+      preparedFundTx.sign(deployerKeypair);
+      await this.provider.sendTransaction(preparedFundTx);
+    }
+
+    return {
+      cAddress,
+      txHash: deployResponse.hash,
+    };
+  }
+
+  /** Query whether a given Ed25519 pubkey (hex) is a registered relayer. */
+  async queryIsRelayer(pubkeyHex: string): Promise<boolean> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_is_relayer', [Buffer.from(pubkeyHex, 'hex')]),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query relayer: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
    * Convert JavaScript values to Soroban SCVals.
    */
   private toScVals(args: any[]): xdr.ScVal[] {
@@ -408,6 +782,9 @@ export class OnboardingBridgeSDK {
     if (typeof arg === 'string') {
       if (arg.startsWith('C') || arg.startsWith('G')) {
         return new Address(arg).toScVal();
+      }
+      if (/^\d+$/.test(arg)) {
+        return nativeToScVal(BigInt(arg), { type: 'i128' });
       }
       return nativeToScVal(arg, { type: 'string' });
     }
