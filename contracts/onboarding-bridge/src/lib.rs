@@ -81,6 +81,8 @@ pub enum DataKey {
     // Issue #72: timelocked upgrade path
     PendingUpgrade,
     CurrentWasmHash,
+    // Issue #21: two-phase admin transfer
+    PendingAdmin,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -181,6 +183,18 @@ fn save_pending_upgrade(env: &Env, pending: &PendingUpgrade) {
 
 fn clear_pending_upgrade(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingUpgrade);
+}
+
+fn save_pending_admin(env: &Env, addr: &Address) {
+    env.storage().instance().set(&DataKey::PendingAdmin, addr);
+}
+
+fn read_pending_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::PendingAdmin)
+}
+
+fn clear_pending_admin(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingAdmin);
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
@@ -1103,6 +1117,38 @@ impl OnboardingBridge {
         env.events()
             .publish(("AdminChanged", old_admin, new_admin.clone()), ());
         Ok(())
+    }
+
+    pub fn propose_new_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_pending_admin(&env, &new_admin);
+        env.events()
+            .publish(("AdminTransferProposed", admin, new_admin), ());
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
+        pending.require_auth();
+        let old_admin = read_admin(&env);
+        save_admin(&env, &pending);
+        let mut config = read_bridge_config(&env);
+        config.admin = pending.clone();
+        save_bridge_config(&env, &config);
+        clear_pending_admin(&env);
+        env.events()
+            .publish(("AdminTransferred", old_admin, pending), ());
+        Ok(())
+    }
+
+    pub fn query_pending_admin(env: Env) -> Option<Address> {
+        read_pending_admin(&env)
     }
 
     pub fn set_minimum_amount(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
