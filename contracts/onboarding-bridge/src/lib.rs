@@ -4,17 +4,6 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
 };
 
-#[cfg(target_family = "wasm")]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
-
-#[cfg(target_family = "wasm")]
-#[alloc_error_handler]
-fn alloc_error(_: core::alloc::Layout) -> ! {
-    core::arch::wasm32::unreachable()
-}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
