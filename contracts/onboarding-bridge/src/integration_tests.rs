@@ -14,7 +14,7 @@ use crate::OnboardingBridge;
 use soroban_sdk::{
     testutils::{Address as _, MockAuth, MockAuthInvoke},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, IntoVal, Vec,
+    Address, Env, IntoVal,
 };
 
 // ── Setup helper ───────────────────────────────────────────────────────────────
@@ -23,6 +23,7 @@ struct Setup {
     env: Env,
     bridge_id: Address,
     token_id: Address,
+    #[allow(dead_code)]
     admin: Address,
     fee_collector: Address,
 }
@@ -156,7 +157,7 @@ fn integration_fee_accumulates_in_bridge() {
     // 3 × 100 fee = 300 accumulated in bridge
     assert_eq!(s.balance(&s.bridge_id), 300);
     // query_fee_balance uses the real token.balance() under the hood
-    assert_eq!(s.bridge().query_fee_balance(&s.token_id).unwrap(), 300);
+    assert_eq!(s.bridge().query_fee_balance(&s.token_id), 300);
 }
 
 // ── Test 3: fee withdrawal from bridge to fee_collector ───────────────────────

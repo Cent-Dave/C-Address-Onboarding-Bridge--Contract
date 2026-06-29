@@ -10,13 +10,15 @@
 //! Output columns: name, cpu_instructions, memory_bytes
 
 #![cfg(test)]
+extern crate std;
+use std::{format, println};
 
 use crate::OnboardingBridge;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::{Address as _, Ledger},
-    Address, Env, IntoVal, Vec,
+    testutils::Address as _,
+    Address, Env, Vec,
 };
 
 // ── Inline minimal token (mirrors the one in tests.rs) ────────────────────────
@@ -51,6 +53,9 @@ impl BenchToken {
     }
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
+        if from == to {
+            return;
+        }
         let fb = Self::balance(e.clone(), from.clone());
         let tb = Self::balance(e.clone(), to.clone());
         e.storage()

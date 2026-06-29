@@ -1,8 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Symbol,
-    Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
 };
 
 #[cfg(target_family = "wasm")]
@@ -45,6 +44,10 @@ pub enum BridgeError {
     // Issue #95: replay protection for Soroban authorization entries
     AuthNonceAlreadyUsed = 23,
     AuthNonceExpired = 24,
+    // Timelocked upgrade errors (issue #72)
+    UpgradeNotScheduled = 25,
+    UpgradeHashMismatch = 26,
+    UpgradeTimelockActive = 27,
 }
 
 #[contracttype]
@@ -86,13 +89,19 @@ pub enum DataKey {
     // Issue #95: per-address auth nonce counter and used-nonce set
     AuthNonce(Address),
     UsedAuthNonce(Address, u64),
+    // Issue #72: timelocked upgrade path
+    PendingUpgrade,
+    CurrentWasmHash,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
+#[allow(dead_code)]
 const MAX_BATCH_SIZE: u32 = 100;
 const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
+/// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
+const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
 
 // --- Packed BridgeConfig struct (fee_bps + paused + allowlist_mode) ---
 
@@ -150,6 +159,39 @@ pub struct TimelockEntry {
     pub release_time: u64,
     pub cliff_time: u64,
     pub claimed: bool,
+}
+
+/// A scheduled WASM upgrade waiting for its timelock to elapse.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// New WASM hash to apply once the timelock expires.
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger sequence at or after which `execute_upgrade` may be called.
+    pub executable_after_ledger: u32,
+}
+
+fn read_current_wasm_hash(env: &Env) -> BytesN<32> {
+    env.storage()
+        .instance()
+        .get(&DataKey::CurrentWasmHash)
+        .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]))
+}
+
+fn save_current_wasm_hash(env: &Env, hash: &BytesN<32>) {
+    env.storage().instance().set(&DataKey::CurrentWasmHash, hash);
+}
+
+fn read_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
+    env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+fn save_pending_upgrade(env: &Env, pending: &PendingUpgrade) {
+    env.storage().instance().set(&DataKey::PendingUpgrade, pending);
+}
+
+fn clear_pending_upgrade(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
@@ -278,6 +320,8 @@ fn mark_initialized(env: &Env) {
     env.storage().instance().set(&DataKey::Initialized, &true);
 }
 
+// TODO: persist minimum_amount to storage so set_minimum_amount / query_minimum_amount
+// actually work.  Current stubs are no-ops and the feature is silently broken.
 #[inline(never)]
 fn save_minimum_amount(env: &Env, amount: &i128) {
     let _ = (env, amount);
@@ -888,7 +932,7 @@ impl OnboardingBridge {
         if targets.len() != amounts.len() {
             return Err(BridgeError::MismatchedArrays);
         }
-        if targets.len() == 0 {
+        if targets.is_empty() {
             return Ok(());
         }
         check_asset_whitelisted(&env, &asset)?;
@@ -905,11 +949,6 @@ impl OnboardingBridge {
         }
 
         let token_client = token::Client::new(&env, &asset);
-        token_client.transfer(&source, &env.current_contract_address(), &total);
-
-        // Cache effective fee bps once — same asset for entire batch
-        let fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, fee_bps);
         let contract_addr = env.current_contract_address();
         token_client.transfer(&source, &contract_addr, &total);
 
@@ -1100,6 +1139,10 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        let accrued = read_accrued_fees(&env, &asset);
+        if amount > accrued {
+            return Err(BridgeError::InsufficientReclaimable);
+        }
         let fee_collector = read_fee_collector(&env);
         fee_collector.require_auth();
         consume_nonce(&env, &fee_collector, nonce)?;
@@ -1120,7 +1163,7 @@ impl OnboardingBridge {
 
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
-        if bps > MAX_FEE_BPS {
+        if bps > 10_000 {
             return Err(BridgeError::FeeTooHigh);
         }
         let admin = read_admin(&env);
@@ -1982,9 +2025,9 @@ impl OnboardingBridge {
         is_auth_nonce_used(&env, &source, nonce)
     }
 
-    pub fn query_accrued_fees(env: Env, asset: Address) -> i128 {
-        check_initialized(&env);
-        read_accrued_fees(&env, &asset)
+    pub fn query_accrued_fees(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_accrued_fees(&env, &asset))
     }
 }
 

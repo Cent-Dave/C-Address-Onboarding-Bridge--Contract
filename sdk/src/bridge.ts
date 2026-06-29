@@ -526,7 +526,7 @@ export class OnboardingBridgeSDK {
 
       return {
         hash: response.hash,
-        status: response.status === 'PENDING' ? 'success' : 'pending',
+        status: response.status === 'ERROR' ? 'failed' : 'pending',
       };
     } catch (error: any) {
       return {
