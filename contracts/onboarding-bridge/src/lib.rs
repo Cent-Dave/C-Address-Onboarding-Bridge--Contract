@@ -37,6 +37,8 @@ pub enum BridgeError {
     UpgradeNotScheduled = 25,
     UpgradeHashMismatch = 26,
     UpgradeTimelockActive = 27,
+    // Issue #23: max withdraw per tx
+    WithdrawExceedsLimit = 28,
 }
 
 #[contracttype]
@@ -85,6 +87,8 @@ pub enum DataKey {
     PendingAdmin,
     // Issue #22: two-phase fee collector transfer
     PendingFeeCollector,
+    // Issue #23: max withdraw per tx
+    MaxWithdrawPerTx,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -209,6 +213,17 @@ fn read_pending_fee_collector(env: &Env) -> Option<Address> {
 
 fn clear_pending_fee_collector(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingFeeCollector);
+}
+
+fn save_max_withdraw_per_tx(env: &Env, amount: i128) {
+    env.storage().instance().set(&DataKey::MaxWithdrawPerTx, &amount);
+}
+
+fn read_max_withdraw_per_tx(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxWithdrawPerTx)
+        .unwrap_or(0)
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
@@ -1220,6 +1235,10 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        let max_withdraw = read_max_withdraw_per_tx(&env);
+        if max_withdraw > 0 && amount > max_withdraw {
+            return Err(BridgeError::WithdrawExceedsLimit);
+        }
         let accrued = read_accrued_fees(&env, &asset);
         if amount > accrued {
             return Err(BridgeError::InsufficientReclaimable);
@@ -1235,6 +1254,24 @@ impl OnboardingBridge {
         env.events()
             .publish(("FeesWithdrawn", fee_collector), (amount, asset));
         Ok(())
+    }
+
+    pub fn set_max_withdraw_per_tx(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_max_withdraw_per_tx(&env, amount);
+        env.events().publish(("MaxWithdrawPerTxSet", admin), (amount,));
+        Ok(())
+    }
+
+    pub fn query_max_withdraw_per_tx(env: Env) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_max_withdraw_per_tx(&env))
     }
 
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
