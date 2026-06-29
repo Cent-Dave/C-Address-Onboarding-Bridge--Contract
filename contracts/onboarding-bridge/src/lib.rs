@@ -1,46 +1,131 @@
+//! # Onboarding Bridge Contract
+//!
+//! A Soroban smart contract that bridges tokens to C-addresses on the Stellar network.
+//! It supports single and batch funding, cross-chain onboarding via a multi-sig relayer
+//! network, timelocked vesting schedules, a referral fee-split system, and a
+//! governance-grade timelocked upgrade path.
+//!
+//! ## Architecture
+//!
+//! All state lives in one of two Soroban storage tiers:
+//!
+//! - **Instance storage** — contract-wide singletons (admin, fee config, asset whitelist,
+//!   relayer threshold, pending upgrade). Extends its TTL on every mutating call.
+//! - **Persistent storage** — per-address or per-asset data (balances, nonces, daily
+//!   usage, timelock entries). Extended explicitly via `extend_persistent_ttl`.
+//!
+//! ## Fee Model
+//!
+//! ```text
+//! fee       = floor(amount × fee_bps / 10_000)
+//! net       = amount − fee
+//! effective = min(global_fee_bps, asset_fee_cap)
+//! tiered    = looked up by source's cumulative bridged volume
+//! ```
+//!
+//! ## Access Control
+//!
+//! Three roles exist:
+//!
+//! | Role | Stored as | Capabilities |
+//! |---|---|---|
+//! | `admin` | `DataKey::Admin` | All privileged mutations |
+//! | `fee_collector` | `DataKey::FeeCollector` | `withdraw_fees` only |
+//! | relayer set | `DataKey::Relayer(pubkey)` | Cross-chain attestation |
+//!
+//! ## Replay Protection
+//!
+//! Two independent mechanisms exist:
+//!
+//! 1. **Sequential nonce** (`DataKey::Nonce`) — optional `nonce: Option<u64>` parameter
+//!    on every mutating function. Pass `None` to skip (standard Stellar transaction
+//!    replay protection applies). Pass `Some(n)` to enforce strict ordering.
+//! 2. **Auth-entry nonce** (`DataKey::UsedAuthNonce`) — used by `verify_auth_entry` to
+//!    permanently burn a `(source, nonce)` pair within a ledger-sequence window, preventing
+//!    Soroban authorization-entry reuse.
+
 #![no_std]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
 };
 
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
 
+/// All error codes that the contract may return.
+///
+/// Every public function that can fail returns `Result<_, BridgeError>`.
+/// Callers should match on these variants to distinguish recoverable from
+/// unrecoverable conditions.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
+    /// Contract has not been initialized yet. Call `initialize` first.
     NotInitialized = 1,
+    /// `initialize` was called on an already-initialized contract.
     AlreadyInitialized = 2,
+    /// A token amount was zero or negative where a positive value is required.
     InvalidAmount = 3,
+    /// The requested fee in basis points exceeds `MAX_FEE_BPS` (1 000).
     FeeTooHigh = 4,
+    /// The `targets` and `amounts` arrays passed to `batch_fund_c_address` have
+    /// different lengths.
     MismatchedArrays = 5,
+    /// A mutating operation was attempted while the contract is paused.
     ContractPaused = 6,
+    /// The target address has been added to the blocklist.
     AddressBlocked = 7,
+    /// The contract is in allowlist mode and the target address is not allowlisted.
     AddressNotAllowlisted = 8,
+    /// The requested withdrawal or reclaim amount exceeds the available balance.
     InsufficientReclaimable = 9,
+    /// The asset is not on the whitelist. Add it with `add_asset` first.
     AssetNotWhitelisted = 10,
+    /// The source address has exceeded its configured daily transfer limit.
     DailyLimitExceeded = 11,
+    /// The supplied sequential nonce does not match the stored value.
     DuplicateNonce = 12,
+    /// The transaction deadline has passed.
     TransactionExpired = 13,
+    /// No loyalty token has been configured. Call `set_loyalty_token` first.
     LoyaltyTokenNotSet = 14,
+    /// A cross-chain `(chain_id, tx_hash)` pair has already been processed.
     ReplayedNonce = 15,
+    /// A signature was supplied by a public key that is not a registered relayer.
     NotRelayer = 16,
+    /// The number of valid relayer signatures is below the required threshold.
     BelowThreshold = 17,
+    /// The threshold would exceed the total number of registered relayers.
     ThresholdExceedsRelayers = 18,
+    /// No timelock entry exists for the given ID.
     TimelockNotFound = 19,
+    /// The timelock's `release_time` has not been reached yet.
     TimelockNotMatured = 20,
+    /// `release_time` is in the past, or `cliff_time` is after `release_time`.
     InvalidReleaseTime = 21,
+    /// The caller is not authorized to perform this action (e.g. double-claim).
     Unauthorized = 22,
-    // Issue #95: replay protection for Soroban authorization entries
+    /// The auth-entry nonce supplied to `verify_auth_entry` has already been used.
     AuthNonceAlreadyUsed = 23,
+    /// The current ledger sequence is outside the `[valid_after, valid_before)` window.
     AuthNonceExpired = 24,
-    // Timelocked upgrade errors (issue #72)
+    /// `execute_upgrade` was called but no upgrade has been scheduled.
     UpgradeNotScheduled = 25,
+    /// The `expected_hash` passed to `execute_upgrade` does not match the scheduled hash.
     UpgradeHashMismatch = 26,
+    /// The scheduled upgrade's timelock period has not yet elapsed.
     UpgradeTimelockActive = 27,
     // Issue #23: max withdraw per tx
     WithdrawExceedsLimit = 28,
 }
 
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
+
+/// Keys used to address every piece of contract state in Soroban storage.
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -93,6 +178,10 @@ pub enum DataKey {
     Entered,
 }
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
 #[allow(dead_code)]
@@ -102,17 +191,27 @@ const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
 
-// --- Packed BridgeConfig struct (fee_bps + paused + allowlist_mode) ---
+// ---------------------------------------------------------------------------
+// Structs
+// ---------------------------------------------------------------------------
 
+/// Packed contract-wide configuration stored in a single instance-storage entry.
+///
+/// Reading and writing this struct as one unit is more efficient than three
+/// separate storage operations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeConfig {
+    /// Bridge fee in basis points (0–1 000).
     pub fee_bps: u32,
+    /// Whether the contract is paused.
     pub paused: bool,
+    /// Whether only allowlisted addresses may receive funds.
     pub allowlist_mode: bool,
 }
 
-// BridgeConfigData: admin + fee_collector + fee_bps snapshot (used in initialize)
+/// Snapshot of admin + fee_collector + fee_bps used during initialization and
+/// cached for efficient admin-auth checks in mutating functions.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeConfigData {
@@ -121,42 +220,66 @@ pub struct BridgeConfigData {
     pub fee_bps: u32,
 }
 
-// --- Asset counters ---
-
+/// Packed per-asset counters stored in a single persistent-storage entry.
+///
+/// All three counters are updated atomically to reduce storage round-trips.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetCounters {
+    /// Fees that have accrued but not yet been withdrawn by the fee collector.
     pub accrued_fees: i128,
+    /// Cumulative net amount delivered to recipients (gross minus fees).
     pub total_bridged: i128,
+    /// Cumulative gross fees collected since deployment.
     pub total_fees_collected: i128,
 }
 
-// --- Fee tier ---
-
+/// A volume-based fee tier.
+///
+/// If a source address's cumulative bridged volume falls within
+/// `[min_volume, max_volume]`, its effective fee is `fee_bps` rather than the
+/// global rate.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeTier {
+    /// Inclusive lower bound on cumulative bridged volume.
     pub min_volume: i128,
+    /// Inclusive upper bound on cumulative bridged volume.
     pub max_volume: i128,
+    /// Fee in basis points for this tier (0–1 000).
     pub fee_bps: u32,
 }
 
+/// An Ed25519 signature from a registered relayer.
+///
+/// Used in `fund_c_address_crosschain` to attest that a cross-chain event
+/// occurred and the payload is authentic.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayerSig {
+    /// The relayer's Ed25519 public key (must be registered via `add_relayer`).
     pub pubkey: BytesN<32>,
+    /// Ed25519 signature over the SHA-256 payload hash.
     pub signature: BytesN<64>,
 }
 
+/// A time-gated funding record created by `fund_c_address_timelocked`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelockEntry {
+    /// The address that deposited the tokens.
     pub source: Address,
+    /// The address that will receive the net amount after `release_time`.
     pub target: Address,
+    /// The token contract address.
     pub asset: Address,
+    /// Gross amount deposited (fee is deducted at claim time).
     pub amount: i128,
+    /// Unix timestamp (seconds) after which `claim_timelocked` may be called.
     pub release_time: u64,
+    /// Optional cliff timestamp; informational only in the current implementation.
     pub cliff_time: u64,
+    /// Set to `true` once `claim_timelocked` has been successfully called.
     pub claimed: bool,
 }
 
@@ -169,6 +292,10 @@ pub struct PendingUpgrade {
     /// Ledger sequence at or after which `execute_upgrade` may be called.
     pub executable_after_ledger: u32,
 }
+
+// ---------------------------------------------------------------------------
+// Private helpers (unchanged from original)
+// ---------------------------------------------------------------------------
 
 fn read_current_wasm_hash(env: &Env) -> BytesN<32> {
     env.storage()
@@ -318,8 +445,6 @@ fn read_fee_collector(env: &Env) -> Address {
         .unwrap()
 }
 
-// --- Packed BridgeConfig accessors (fee_bps + paused + allowlist_mode in one entry) ---
-
 fn read_config(env: &Env) -> BridgeConfig {
     env.storage()
         .instance()
@@ -465,8 +590,6 @@ fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError
     }
     Ok(())
 }
-
-// --- Packed AssetCounters accessors (3 i128 counters in one persistent entry per asset) ---
 
 fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
     env.storage()
@@ -889,6 +1012,53 @@ pub struct OnboardingBridge;
 
 #[contractimpl]
 impl OnboardingBridge {
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Initialises the bridge contract. Must be called exactly once before any
+    /// other function.
+    ///
+    /// Sets the admin, fee collector, and initial fee rate, then marks the
+    /// contract as initialised and extends the instance TTL.
+    ///
+    /// # Arguments
+    ///
+    /// * `admin` (`Address`) — Address that will hold administrative privileges.
+    ///   Must authorise this call.
+    /// * `fee_collector` (`Address`) — Address entitled to call `withdraw_fees`.
+    /// * `fee_bps` (`u32`) — Initial fee in basis points. Must be ≤ 1 000 (10 %).
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///   Pass `None` to skip nonce enforcement.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `admin.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::AlreadyInitialized`] — Contract has already been initialised.
+    /// * [`BridgeError::FeeTooHigh`] — `fee_bps` exceeds 1 000.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the stored value.
+    ///
+    /// # Events
+    ///
+    /// * `("Initialized", admin, fee_collector)` — data: `(fee_bps,)`
+    ///
+    /// # Security Considerations
+    ///
+    /// This function is the single gate that prevents double-initialisation.
+    /// The check is performed before `require_auth` so that the initialised flag
+    /// is always respected regardless of authorisation state. Deploy and call
+    /// `initialize` atomically (e.g. in the same transaction) to prevent
+    /// front-running by a third party who could set themselves as admin.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    /// // assert_eq!(bridge.query_fee_bps(), 50u32);
+    /// ```
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -920,6 +1090,65 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Core bridging
+    // -----------------------------------------------------------------------
+
+    /// Funds a C-address with tokens from a source account.
+    ///
+    /// Transfers `amount` from `source` into the contract, deducts the
+    /// effective fee, then forwards the net amount to `target`.  The effective
+    /// fee is the minimum of the global fee rate, the per-asset cap, and any
+    /// volume-based tier that applies to `source`.
+    ///
+    /// If a loyalty token has been configured, the contract mints a loyalty
+    /// reward to `source` after the transfer.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The account providing the tokens. Must authorise.
+    /// * `target` (`Address`) — The C-address receiving the net amount.
+    /// * `asset` (`Address`) — The whitelisted token contract address.
+    /// * `amount` (`i128`) — Gross amount to transfer. Must be > 0.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for `source`.
+    /// * `deadline` (`Option<u64>`) — Optional Unix timestamp (seconds) after
+    ///   which the call is rejected. Pass `None` for no expiry.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and
+    ///   `target` is not allowlisted.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::DailyLimitExceeded`] — Transfer would exceed `source`'s
+    ///   daily limit for this asset.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("CAddressFunded", source, target)` — data: `(amount, fee, asset)`
+    ///
+    /// # Security Considerations
+    ///
+    /// Access checks (`check_access`) are evaluated before `require_auth` so
+    /// that blocked/non-allowlisted targets are rejected without consuming the
+    /// caller's authorization budget. The fee is floored (integer division), so
+    /// for very small amounts the effective fee may be 0.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // Fund 500 stroops to `target` with no deadline or nonce:
+    /// // bridge.fund_c_address(&source, &target, &usdc, &500i128, &None, &None);
+    /// ```
     pub fn fund_c_address(
         env: Env,
         source: Address,
@@ -973,6 +1202,64 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Funds multiple C-addresses in a single transaction from one source account.
+    ///
+    /// Pulls `sum(amounts)` from `source` in one token transfer, then iterates
+    /// over each `(target, amount)` pair. Blocked or non-allowlisted targets are
+    /// **skipped** (their amount is refunded to `source`) rather than aborting
+    /// the entire batch. A single `BatchCompleted` event summarises successes
+    /// and failures at the end.
+    ///
+    /// Transfers to the same target address are aggregated into a single token
+    /// transfer to reduce fee consumption.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The account providing all tokens. Must authorise.
+    /// * `targets` (`Vec<Address>`) — Ordered list of recipient C-addresses.
+    /// * `amounts` (`Vec<i128>`) — Gross amount for each recipient. Must be the
+    ///   same length as `targets`. Every element must be > 0.
+    /// * `asset` (`Address`) — The whitelisted token contract address.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for `source`.
+    /// * `deadline` (`Option<u64>`) — Optional Unix timestamp cutoff.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
+    /// * [`BridgeError::MismatchedArrays`] — `targets.len() != amounts.len()`.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("CAddressFunded", source, target)` — Emitted per successful entry;
+    ///   data: `(amount, fee, asset)`.
+    /// * `("BatchTransferFailed", source, target)` — Emitted per skipped entry;
+    ///   data: `(amount, "access_denied")`.
+    /// * `("BatchCompleted", source)` — Emitted once at the end;
+    ///   data: `(num_success, num_failures)`.
+    ///
+    /// # Security Considerations
+    ///
+    /// The full batch total is pulled from `source` upfront. If any entries are
+    /// blocked, those amounts are returned to `source` at the end of execution.
+    /// The validation loop that checks for zero/negative amounts runs before
+    /// the initial token pull, so no tokens are moved on validation failures.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // let targets = Vec::from_array(&env, [addr1, addr2]);
+    /// // let amounts = Vec::from_array(&env, [1000i128, 500i128]);
+    /// // bridge.batch_fund_c_address(&source, &targets, &amounts, &usdc, &None, &None);
+    /// ```
     pub fn batch_fund_c_address(
         env: Env,
         source: Address,
@@ -1080,6 +1367,42 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Fee configuration
+    // -----------------------------------------------------------------------
+
+    /// Updates the global fee rate in basis points.
+    ///
+    /// The new rate applies to all subsequent `fund_c_address` and
+    /// `batch_fund_c_address` calls. Per-asset caps and volume tiers further
+    /// constrain the effective rate downward.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_fee_bps` (`u32`) — New fee rate. Must be ≤ 1 000 (10 %).
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::FeeTooHigh`] — `new_fee_bps` exceeds 1 000.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("FeeBpsChanged", old_fee_bps, new_fee_bps)` — data: `(admin,)`
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // bridge.set_fee_bps(&200u32, &None); // set to 2 %
+    /// // assert_eq!(bridge.query_fee_bps(), 200u32);
+    /// ```
     pub fn set_fee_bps(env: Env, new_fee_bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1099,6 +1422,35 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Sets a maximum daily transfer limit for a specific `(source, asset)` pair.
+    ///
+    /// Once set, any `fund_c_address` call from `source` using `asset` that
+    /// would push the day's cumulative volume past `limit_amount` is rejected.
+    /// Set `limit_amount` to `0` to disable the limit entirely.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address whose daily throughput is being capped.
+    /// * `asset` (`Address`) — The asset the limit applies to.
+    /// * `limit_amount` (`i128`) — Maximum gross tokens allowed per calendar day
+    ///   (UTC, measured in ledger timestamp / 86 400). Use `0` to disable.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // Allow user to move at most 10 000 USDC per day:
+    /// // bridge.set_source_daily_limit(&user, &usdc, &10_000i128, &None);
+    /// ```
     pub fn set_source_daily_limit(
         env: Env,
         source: Address,
@@ -1115,6 +1467,19 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the daily transfer limit for a `(source, asset)` pair.
+    ///
+    /// Returns `0` if no limit has been configured, meaning transfers are
+    /// unrestricted for that pair.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address to query.
+    /// * `asset` (`Address`) — The asset to query.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_source_daily_limit(
         env: Env,
         source: Address,
@@ -1124,6 +1489,34 @@ impl OnboardingBridge {
         Ok(read_source_daily_limit(&env, &source, &asset))
     }
 
+    /// Sets a per-asset maximum fee cap in basis points.
+    ///
+    /// The effective fee for `asset` is `min(global_fee_bps, cap)`.
+    /// Useful for stablecoins or high-value assets where the global rate
+    /// would otherwise be too aggressive.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The token contract whose fee is being capped.
+    /// * `max_fee_bps` (`u32`) — Cap in basis points. Must be ≤ 1 000.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::FeeTooHigh`] — `max_fee_bps` exceeds 1 000.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // Cap USDC fees at 0.5 % regardless of global rate:
+    /// // bridge.set_asset_fee_cap(&usdc, &50u32, &None);
+    /// ```
     pub fn set_asset_fee_cap(
         env: Env,
         asset: Address,
@@ -1142,6 +1535,18 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the fee cap configured for `asset`.
+    ///
+    /// Returns the contract-wide `MAX_FEE_BPS` (1 000) if no cap has been set,
+    /// meaning the global rate applies uncapped.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The token contract to query.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_asset_fee_cap(
         env: Env,
         asset: Address,
@@ -1150,6 +1555,33 @@ impl OnboardingBridge {
         Ok(read_asset_fee_cap(&env, &asset))
     }
 
+    /// Changes the address that is entitled to call `withdraw_fees`.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_fee_collector` (`Address`) — Replacement fee collector.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("FeeCollectorChanged", old_collector, new_fee_collector)` — data: `(admin,)`
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // bridge.set_fee_collector(&new_collector, &None);
+    /// // assert_eq!(bridge.query_fee_collector(), new_collector);
+    /// ```
     pub fn set_fee_collector(env: Env, new_fee_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1263,11 +1695,60 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the configured minimum transfer amount.
+    ///
+    /// > **Note:** Currently always returns `0` because the persistence layer
+    /// > is a stub. See `set_minimum_amount` for details.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_minimum_amount(env: Env) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_minimum_amount(&env))
     }
 
+    /// Withdraws accrued protocol fees to the fee collector.
+    ///
+    /// Transfers `amount` of `asset` from the contract to the fee collector and
+    /// decrements the on-chain accrued-fees counter.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The token contract whose accrued fees are being withdrawn.
+    /// * `amount` (`i128`) — Amount to withdraw. Must be > 0 and ≤ accrued balance.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the fee collector.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current fee collector's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds the
+    ///   accrued fee balance for `asset`.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("FeesWithdrawn", fee_collector)` — data: `(amount, asset)`
+    ///
+    /// # Security Considerations
+    ///
+    /// Only the fee collector may call this function. Accrued fees are tracked
+    /// separately from the contract's token balance, so this function can never
+    /// withdraw tokens that were sent to the contract for other purposes (use
+    /// `reclaim_tokens` for that).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // Withdraw all 5 accrued fee tokens:
+    /// // bridge.withdraw_fees(&usdc, &5i128, &None);
+    /// ```
     pub fn withdraw_fees(env: Env, asset: Address, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1320,6 +1801,31 @@ impl OnboardingBridge {
         Ok(read_fee_bps(&env))
     }
 
+    /// Sets the referral fee rate as a share of the protocol fee.
+    ///
+    /// When `fund_c_address_with_referral` is called with a referrer, the
+    /// referrer receives `fee × referral_rate / 10_000` of the protocol fee,
+    /// and the remainder accrues to the contract.
+    ///
+    /// # Arguments
+    ///
+    /// * `bps` (`u32`) — Referral share in basis points relative to the fee
+    ///   (0–10 000). E.g. `2000` means the referrer gets 20 % of the fee.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::FeeTooHigh`] — `bps` exceeds 10 000.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("ReferralRateChanged", bps)` — no additional data.
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1334,11 +1840,77 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the current referral rate in basis points.
+    ///
+    /// Returns `0` (no referral split) if `set_referral_rate` has never been called.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_referral_rate(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(read_referral_rate(&env))
     }
 
+    /// Funds a C-address with an optional referrer that receives a share of the fee.
+    ///
+    /// Behaves identically to `fund_c_address` except that when `referrer` is
+    /// `Some(addr)`, the referral portion of the protocol fee is transferred
+    /// directly to that address immediately. The remainder accrues in the
+    /// contract as usual.
+    ///
+    /// ```text
+    /// fee          = floor(amount × effective_fee_bps / 10_000)
+    /// referral_fee = floor(fee × referral_rate / 10_000)   (0 if referrer is None)
+    /// protocol_fee = fee − referral_fee
+    /// net          = amount − fee
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The account providing the tokens. Must authorise.
+    /// * `target` (`Address`) — The C-address receiving `net` tokens.
+    /// * `asset` (`Address`) — The whitelisted token contract.
+    /// * `amount` (`i128`) — Gross amount. Must be > 0.
+    /// * `referrer` (`Option<Address>`) — Address to receive the referral cut,
+    ///   or `None` for no referral.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
+    ///   is not allowlisted.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded for
+    ///   `(source, asset)`.
+    ///
+    /// # Events
+    ///
+    /// * `("ReferralPaid", source, referrer)` — Emitted only when `referrer` is
+    ///   `Some` and `referral_fee > 0`; data: `(rf, asset)`.
+    /// * `("CAddressFunded", source, target)` — data: `(amount, fee, asset)`.
+    ///
+    /// # Security Considerations
+    ///
+    /// Unlike `fund_c_address`, this function does not accept a `nonce` or
+    /// `deadline` parameter. Callers relying on replay protection should use
+    /// `verify_auth_entry` in conjunction with this call, or use the standard
+    /// Stellar transaction sequence-number mechanism.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // bridge.fund_c_address_with_referral(
+    /// //     &source, &target, &usdc, &1000i128, &Some(referrer),
+    /// // );
+    /// ```
     pub fn fund_c_address_with_referral(
         env: Env,
         source: Address,
@@ -1398,21 +1970,64 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Query helpers
+    // -----------------------------------------------------------------------
+
+    /// Returns the current fee collector address.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_fee_collector(env: Env) -> Result<Address, BridgeError> {
         check_initialized(&env)?;
         Ok(read_fee_collector(&env))
     }
 
+    /// Returns the current admin address.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_admin(env: Env) -> Result<Address, BridgeError> {
         check_initialized(&env)?;
         Ok(read_admin(&env))
     }
 
+    /// Returns the token balance of `c_address` for `asset`.
+    ///
+    /// This is a pure read-through to the token contract; it does not require
+    /// the contract to be initialised and has no access-control checks.
+    ///
+    /// # Arguments
+    ///
+    /// * `c_address` (`Address`) — The address whose balance is queried.
+    /// * `asset` (`Address`) — The token contract address.
     pub fn query_balance(env: Env, c_address: Address, asset: Address) -> i128 {
         let token_client = token::Client::new(&env, &asset);
         token_client.balance(&c_address)
     }
 
+    /// Returns the bridge contract's own balance for each asset in `assets`.
+    ///
+    /// Useful for monitoring the contract's total holdings across multiple tokens
+    /// in a single call.
+    ///
+    /// # Arguments
+    ///
+    /// * `assets` (`Vec<Address>`) — List of token contract addresses to query.
+    ///
+    /// # Returns
+    ///
+    /// A `Map<Address, i128>` mapping each asset address to the contract's balance.
+    /// Assets with a zero balance are included.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // let assets = Vec::from_array(&env, [usdc, xlm]);
+    /// // let balances = bridge.query_all_balances(&assets);
+    /// ```
     pub fn query_all_balances(env: Env, assets: Vec<Address>) -> Map<Address, i128> {
         let contract = env.current_contract_address();
         let mut result: Map<Address, i128> = Map::new(&env);
@@ -1424,20 +2039,62 @@ impl OnboardingBridge {
         result
     }
 
+    /// Returns the contract's total token balance for `asset`.
+    ///
+    /// This includes both accrued fees and any tokens held for other purposes
+    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate just the
+    /// fee portion.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         let token_client = token::Client::new(&env, &asset);
         Ok(token_client.balance(&env.current_contract_address()))
     }
 
+    /// Returns `true` if the contract has been initialised.
     pub fn query_is_initialized(env: Env) -> bool {
         read_initialized(&env)
     }
 
+    /// Returns the current sequential nonce value for `caller`.
+    ///
+    /// The returned value is the next nonce that must be passed to succeed if
+    /// the caller chooses to enforce nonce checking. Returns `0` for addresses
+    /// that have never used a nonce.
+    ///
+    /// # Arguments
+    ///
+    /// * `caller` (`Address`) — The address whose nonce is queried.
     pub fn query_nonce(env: Env, caller: Address) -> u64 {
         read_nonce(&env, &caller)
     }
 
+    /// Simulates the fee and net amount for a given gross amount at the current
+    /// global fee rate.
+    ///
+    /// Does not account for per-asset caps or volume tiers; use this for a
+    /// quick estimate only.
+    ///
+    /// # Arguments
+    ///
+    /// * `gross_amount` (`i128`) — The hypothetical gross transfer amount.
+    ///
+    /// # Returns
+    ///
+    /// `(fee, net)` where `fee = floor(gross × fee_bps / 10_000)` and
+    /// `net = gross − fee`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // At fee_bps = 100 (1 %):
+    /// // let (fee, net) = bridge.query_calculate_fee(&1000i128);
+    /// // assert_eq!(fee, 10i128);
+    /// // assert_eq!(net, 990i128);
+    /// ```
     pub fn query_calculate_fee(env: Env, gross_amount: i128) -> (i128, i128) {
         let fee_bps = read_fee_bps(&env);
         let fee = calculate_fee(gross_amount, fee_bps);
@@ -1445,16 +2102,68 @@ impl OnboardingBridge {
         (fee, net)
     }
 
+    /// Returns the cumulative net amount of `asset` that has been delivered to
+    /// recipients since deployment.
+    ///
+    /// "Total bridged" counts only the net portion (gross minus fee), not the
+    /// gross transferred by sources.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_total_bridged(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_total_bridged(&env, &asset))
     }
 
+    /// Returns the cumulative gross fees collected for `asset` since deployment.
+    ///
+    /// This counter only increases and is not decremented when fees are
+    /// withdrawn. To see the currently *pending* (not yet withdrawn) fee
+    /// balance, use `query_accrued_fees`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_total_fees_collected(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_total_fees_collected(&env, &asset))
     }
 
+    // -----------------------------------------------------------------------
+    // Pause / Unpause
+    // -----------------------------------------------------------------------
+
+    /// Pauses the contract, disabling all mutating operations.
+    ///
+    /// While paused, calls to `fund_c_address`, `batch_fund_c_address`,
+    /// `withdraw_fees`, `set_fee_bps`, `set_fee_collector`, `set_admin`, and
+    /// several other state-modifying functions return
+    /// [`BridgeError::ContractPaused`]. Read-only `query_*` functions are
+    /// unaffected.
+    ///
+    /// # Arguments
+    ///
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("ContractPaused",)` — data: `(admin,)`
+    ///
+    /// # Security Considerations
+    ///
+    /// Pausing is an emergency mechanism. It does not prevent the admin from
+    /// scheduling or executing upgrades, which are intentionally not pause-gated
+    /// so that an upgrade can fix whatever condition required the pause.
     pub fn pause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1466,6 +2175,24 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Resumes normal contract operation after a pause.
+    ///
+    /// # Arguments
+    ///
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("ContractUnpaused",)` — data: `(admin,)`
     pub fn unpause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1477,10 +2204,46 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns `true` if the contract is currently paused.
     pub fn query_is_paused(env: Env) -> bool {
         read_paused(&env)
     }
 
+    // -----------------------------------------------------------------------
+    // Upgrade (immediate)
+    // -----------------------------------------------------------------------
+
+    /// Immediately upgrades the contract WASM to `new_wasm_hash`.
+    ///
+    /// This is the **untimelocked** upgrade path. For production deployments,
+    /// prefer `schedule_upgrade` + `execute_upgrade` which enforces a ~24-hour
+    /// delay, giving users time to react.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_wasm_hash` (`BytesN<32>`) — The hash of the new WASM blob, which
+    ///   must already have been uploaded to the network via
+    ///   `Deployer::upload_contract_wasm`.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("ContractUpgraded",)` — data: `(old_hash, new_wasm_hash, admin)`
+    ///
+    /// # Security Considerations
+    ///
+    /// After this call the contract executes new code in the same transaction.
+    /// The `old_hash` in the event lets off-chain monitors detect unexpected
+    /// upgrades. Consider using the timelocked path for mainnet deployments.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1505,16 +2268,57 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    // --- Issue #72: timelocked upgrade path ---
+    // -----------------------------------------------------------------------
+    // Timelocked upgrade path (issue #72)
+    // -----------------------------------------------------------------------
 
-    /// Schedule a WASM upgrade that becomes executable after a timelock delay.
+    /// Schedules a WASM upgrade that becomes executable after a ~24-hour timelock.
     ///
-    /// The upgrade will only be executable once
-    /// `env.ledger().sequence() >= current_sequence + UPGRADE_TIMELOCK_LEDGERS`
-    /// (~24 hours at 5 s/ledger).
+    /// The upgrade is executable once
+    /// `env.ledger().sequence() ≥ current_sequence + UPGRADE_TIMELOCK_LEDGERS`
+    /// (17 280 ledgers at 5 s/ledger ≈ 24 hours).
     ///
-    /// Only one upgrade may be pending at a time. Call `cancel_upgrade` first
-    /// to replace a pending upgrade.
+    /// Only one pending upgrade may exist at a time. Call `cancel_upgrade`
+    /// first if you need to replace a pending upgrade.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_wasm_hash` (`BytesN<32>`) — Hash of the new WASM blob to apply
+    ///   after the timelock elapses.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Returns
+    ///
+    /// The ledger sequence number at or after which `execute_upgrade` may be
+    /// called (`executable_after_ledger`).
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("UpgradeScheduled",)` — data: `(new_wasm_hash, executable_after_ledger, admin)`
+    ///
+    /// # Security Considerations
+    ///
+    /// Off-chain monitoring tools should watch for `UpgradeScheduled` events
+    /// and alert stakeholders so they can review the proposed WASM before the
+    /// timelock expires. Use `cancel_upgrade` to abort if the scheduled hash
+    /// turns out to be malicious.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // let unlock_ledger = bridge.schedule_upgrade(&new_wasm_hash, &None);
+    /// // // wait until env.ledger().sequence() >= unlock_ledger, then:
+    /// // bridge.execute_upgrade(&new_wasm_hash, &None);
+    /// ```
     pub fn schedule_upgrade(
         env: Env,
         new_wasm_hash: BytesN<32>,
@@ -1544,11 +2348,37 @@ impl OnboardingBridge {
         Ok(executable_after_ledger)
     }
 
-    /// Execute a previously scheduled upgrade once its timelock has elapsed.
+    /// Executes a previously scheduled upgrade once its timelock has elapsed.
     ///
-    /// `expected_hash` must match the hash that was scheduled — this prevents
-    /// a race where the admin changes the pending hash between scheduling and
-    /// execution.
+    /// `expected_hash` must match the hash that was passed to `schedule_upgrade`.
+    /// This prevents a race condition where the admin could change the pending
+    /// hash between scheduling and execution by requiring the caller to commit
+    /// to the exact hash they are applying.
+    ///
+    /// The pending upgrade record is cleared **before** calling
+    /// `update_current_contract_wasm` to prevent re-entrant replay.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_hash` (`BytesN<32>`) — Must match `PendingUpgrade::new_wasm_hash`.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::UpgradeNotScheduled`] — No pending upgrade exists.
+    /// * [`BridgeError::UpgradeHashMismatch`] — `expected_hash` does not match
+    ///   the scheduled hash.
+    /// * [`BridgeError::UpgradeTimelockActive`] — The timelock has not yet elapsed.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("ContractUpgraded",)` — data: `(old_hash, new_wasm_hash, admin)`
     pub fn execute_upgrade(
         env: Env,
         expected_hash: BytesN<32>,
@@ -1590,7 +2420,28 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    /// Cancel a pending scheduled upgrade. Only callable by admin.
+    /// Cancels a pending scheduled upgrade.
+    ///
+    /// After cancellation, `execute_upgrade` will return
+    /// [`BridgeError::UpgradeNotScheduled`] until a new upgrade is scheduled.
+    ///
+    /// # Arguments
+    ///
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::UpgradeNotScheduled`] — No pending upgrade to cancel.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("UpgradeCancelled",)` — data: `(cancelled_wasm_hash, admin)`
     pub fn cancel_upgrade(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1610,13 +2461,39 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    /// Query the pending scheduled upgrade, if any.
+    /// Returns the pending scheduled upgrade, if any.
+    ///
+    /// Returns `None` if no upgrade has been scheduled or if a previous
+    /// upgrade has already been executed or cancelled.
     pub fn query_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         read_pending_upgrade(&env)
     }
 
-    // --- Blocklist / Allowlist ---
+    // -----------------------------------------------------------------------
+    // Blocklist / Allowlist
+    // -----------------------------------------------------------------------
 
+    /// Adds `address` to the blocklist.
+    ///
+    /// Blocked addresses cannot be used as `target` in any funding call.
+    /// Existing timelocked entries for a blocked address are not affected
+    /// retroactively; however, `claim_timelocked` itself is not blocked (the
+    /// recipient calls it directly). Blocking takes effect immediately for all
+    /// new funding calls.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` (`Address`) — The address to block.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_to_blocklist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1629,6 +2506,21 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Removes `address` from the blocklist, restoring its ability to receive funds.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` (`Address`) — The address to unblock.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_from_blocklist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1641,6 +2533,25 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Adds `address` to the allowlist.
+    ///
+    /// Only relevant when the contract is in allowlist mode
+    /// (`set_allowlist_mode(true)`). In that mode, only allowlisted addresses
+    /// may be used as `target` in funding calls.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` (`Address`) — The address to allowlist.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_to_allowlist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1653,6 +2564,24 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Removes `address` from the allowlist.
+    ///
+    /// If the contract is in allowlist mode, the address will no longer be
+    /// able to receive funds until re-added.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` (`Address`) — The address to remove from the allowlist.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_from_allowlist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1665,6 +2594,27 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Enables or disables allowlist mode.
+    ///
+    /// When `enabled` is `true`, only addresses that have been explicitly added
+    /// via `add_to_allowlist` may receive tokens. When `false` (the default),
+    /// any non-blocked address may receive tokens.
+    ///
+    /// The blocklist is **always** enforced regardless of this setting.
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` (`bool`) — `true` to enable allowlist mode, `false` to disable.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn set_allowlist_mode(env: Env, enabled: bool, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1675,18 +2625,61 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns `true` if `address` is on the blocklist.
     pub fn query_is_blocked(env: Env, address: Address) -> bool {
         is_blocked(&env, &address)
     }
 
+    /// Returns `true` if `address` is on the allowlist.
     pub fn query_is_allowlisted(env: Env, address: Address) -> bool {
         is_allowlisted(&env, &address)
     }
 
+    /// Returns `true` if allowlist mode is currently enabled.
     pub fn query_allowlist_mode(env: Env) -> bool {
         allowlist_mode(&env)
     }
 
+    // -----------------------------------------------------------------------
+    // Token reclaim
+    // -----------------------------------------------------------------------
+
+    /// Allows the admin to recover tokens that were accidentally sent to the
+    /// contract and are not owed as fees.
+    ///
+    /// The reclaimable amount is `contract_token_balance − accrued_fees`.
+    /// This ensures the admin cannot drain fee reserves that belong to the
+    /// fee collector.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The token to reclaim.
+    /// * `amount` (`i128`) — Amount to recover. Must be > 0 and ≤ reclaimable.
+    /// * `destination` (`Address`) — Address to send the recovered tokens to.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds
+    ///   `contract_balance − accrued_fees`.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("TokensReclaimed", admin, asset)` — data: `(amount, destination)`
+    ///
+    /// # Security Considerations
+    ///
+    /// The check `reclaimable = balance − accrued_fees` ensures that fee
+    /// reserves are ring-fenced. However, timelocked funds also sit in the
+    /// contract balance and are not tracked separately. Do not reclaim tokens
+    /// if there are active timelocks denominated in the same asset.
     pub fn reclaim_tokens(
         env: Env,
         asset: Address,
@@ -1718,8 +2711,29 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    // --- Asset Whitelist ---
+    // -----------------------------------------------------------------------
+    // Asset whitelist
+    // -----------------------------------------------------------------------
 
+    /// Adds `asset` to the token whitelist.
+    ///
+    /// Only whitelisted assets may be used in `fund_c_address`,
+    /// `batch_fund_c_address`, and related funding functions. Adding an asset
+    /// that is already whitelisted is idempotent.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The token contract address to whitelist.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1732,6 +2746,25 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Removes `asset` from the token whitelist.
+    ///
+    /// After removal, any funding call that references this asset returns
+    /// [`BridgeError::AssetNotWhitelisted`]. Existing accrued fee counters
+    /// and historical stats for the asset are retained in storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The token contract address to remove.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1744,18 +2777,56 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns `true` if `asset` is currently on the whitelist.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_asset_whitelisted(env: Env, asset: Address) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).get(asset).unwrap_or(false))
     }
 
+    /// Returns the list of all currently whitelisted asset addresses.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).keys())
     }
 
-    // --- Loyalty Token ---
+    // -----------------------------------------------------------------------
+    // Loyalty token
+    // -----------------------------------------------------------------------
 
+    /// Configures the loyalty token and the fixed reward minted to the source
+    /// on every successful `fund_c_address` call.
+    ///
+    /// The contract must already hold a balance of `token` equal to or greater
+    /// than the rewards it intends to distribute. There is no automatic minting;
+    /// the contract transfers from its own balance.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` (`Address`) — The loyalty token contract address.
+    /// * `amount_per_fund` (`i128`) — Fixed amount transferred to `source` on
+    ///   each `fund_c_address` call. Use `0` to effectively disable rewards.
+    ///   Must be ≥ 0.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidAmount`] — `amount_per_fund` < 0.
+    ///
+    /// # Events
+    ///
+    /// * `("LoyaltyTokenSet", admin)` — data: `(token, amount_per_fund)`
     pub fn set_loyalty_token(
         env: Env,
         token: Address,
@@ -1775,6 +2846,16 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the loyalty token address and reward amount per fund.
+    ///
+    /// # Returns
+    ///
+    /// `(token_address, amount_per_fund)`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::LoyaltyTokenNotSet`] — No loyalty token has been configured.
     pub fn query_loyalty_token(env: Env) -> Result<(Address, i128), BridgeError> {
         check_initialized(&env)?;
         let token = read_loyalty_token(&env).ok_or(BridgeError::LoyaltyTokenNotSet)?;
@@ -1782,8 +2863,43 @@ impl OnboardingBridge {
         Ok((token, amount))
     }
 
-    // --- Tiered Fees ---
+    // -----------------------------------------------------------------------
+    // Tiered fees
+    // -----------------------------------------------------------------------
 
+    /// Configures volume-based fee tiers for the bridge.
+    ///
+    /// Once tiers are set, the fee applied to a `fund_c_address` call is
+    /// determined by the source address's cumulative bridged volume:
+    ///
+    /// ```text
+    /// for each tier in tiers:
+    ///     if source_volume ∈ [tier.min_volume, tier.max_volume]:
+    ///         effective_fee_bps = tier.fee_bps
+    ///         break
+    /// else:
+    ///     effective_fee_bps = global_fee_bps  (fallback)
+    /// ```
+    ///
+    /// The per-asset cap still applies on top of the tiered rate.
+    ///
+    /// # Arguments
+    ///
+    /// * `tiers` (`Vec<FeeTier>`) — Ordered list of fee tiers. Each tier's
+    ///   `fee_bps` must be ≤ 1 000.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::FeeTooHigh`] — Any tier's `fee_bps` exceeds 1 000.
+    ///
+    /// # Events
+    ///
+    /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
     pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1801,6 +2917,14 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the configured fee tiers.
+    ///
+    /// If no tiers have been set, returns a single synthetic tier covering the
+    /// full volume range `[0, i128::MAX]` at the current global fee rate.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_fee_tiers(env: Env) -> Result<Vec<FeeTier>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_fee_tiers(&env).unwrap_or_else(|| {
@@ -1815,6 +2939,19 @@ impl OnboardingBridge {
         }))
     }
 
+    /// Returns the fee tier that currently applies to `source`, based on their
+    /// cumulative bridged volume.
+    ///
+    /// If no tier matches, returns a synthetic default tier using the global
+    /// fee rate, covering the full volume range.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address to look up.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_current_tier(env: Env, source: Address) -> Result<FeeTier, BridgeError> {
         check_initialized(&env)?;
         Ok(find_current_tier(&env, &source).unwrap_or_else(|| {
@@ -1827,20 +2964,75 @@ impl OnboardingBridge {
         }))
     }
 
-    // --- Cross-chain Onboarding ---
+    // -----------------------------------------------------------------------
+    // Cross-chain onboarding
+    // -----------------------------------------------------------------------
 
-    /// Fund a C-address from a cross-chain event.
+    /// Credits a C-address from a cross-chain event, verified by M-of-N relayer signatures.
     ///
-    /// Parameters:
-    /// - `chain_id`  : numeric id of the source chain (e.g. 1 = Ethereum, 101 = Solana)
-    /// - `tx_hash`   : 32-byte hash of the source-chain transaction
-    /// - `target`    : Soroban C-address to credit
-    /// - `asset`     : whitelisted token contract address
-    /// - `amount`    : gross amount (fee deducted before crediting target)
-    /// - `sigs`      : at least `threshold` distinct relayer Ed25519 signatures over
-    ///                 sha256(chain_id_be4 || tx_hash || target_bytes || asset_bytes ||
-    ///                        amount_be16 || nonce)
-    ///                 where nonce = sha256(chain_id_be4 || tx_hash)
+    /// This function allows off-chain relayers to bridge tokens that arrived
+    /// on another chain (e.g. Ethereum, Solana) to a Soroban C-address.
+    /// The contract must already hold a sufficient balance of `asset` to pay
+    /// out `net_amount` to the target.
+    ///
+    /// ## Payload Construction
+    ///
+    /// Relayers must sign `sha256(payload)` where:
+    ///
+    /// ```text
+    /// nonce   = sha256(chain_id_be4 || tx_hash)
+    /// payload = chain_id_be4
+    ///        || tx_hash
+    ///        || sha256(target_strkey_bytes)
+    ///        || sha256(asset_strkey_bytes)
+    ///        || amount_be16
+    ///        || nonce
+    /// ```
+    ///
+    /// ## Parameters
+    ///
+    /// * `chain_id` (`u32`) — Numeric source-chain ID (e.g. 1 = Ethereum mainnet,
+    ///   101 = Solana mainnet).
+    /// * `tx_hash` (`BytesN<32>`) — The 32-byte hash of the source-chain transaction.
+    /// * `target` (`Address`) — The Soroban C-address to credit.
+    /// * `asset` (`Address`) — Whitelisted token contract address.
+    /// * `amount` (`i128`) — Gross amount (fee is deducted before crediting `target`).
+    /// * `sigs` (`Vec<RelayerSig>`) — At least `threshold` distinct relayer Ed25519
+    ///   signatures over the payload hash (see above).
+    ///
+    /// # Authorization
+    ///
+    /// No Soroban `require_auth` — authentication is via Ed25519 signatures from
+    /// registered relayers. The caller may be any account.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
+    ///   is not allowlisted.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::ReplayedNonce`] — This `(chain_id, tx_hash)` combination
+    ///   has already been processed.
+    /// * [`BridgeError::NotRelayer`] — A signature's pubkey is not a registered relayer.
+    /// * [`BridgeError::BelowThreshold`] — Fewer than `threshold` valid signatures.
+    ///
+    /// # Events
+    ///
+    /// * `("CrossChainFunded", target)` — data: `(chain_id, tx_hash, amount, fee, asset)`
+    ///
+    /// # Security Considerations
+    ///
+    /// The nonce is derived deterministically from `(chain_id, tx_hash)` and
+    /// marked used before the token transfer, preventing replay attacks. An
+    /// invalid Ed25519 signature causes a host-level trap (panic) rather than
+    /// returning an error code, so callers should pre-validate signatures
+    /// off-chain. The contract does not verify that `sigs` contains distinct
+    /// pubkeys — a single relayer submitting the same signature twice counts
+    /// as two signatures and could satisfy a threshold of 2. Callers and
+    /// relayer infrastructure should deduplicate signatures before submission.
     pub fn fund_c_address_crosschain(
         env: Env,
         chain_id: u32,
@@ -1940,6 +3132,22 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Registers an Ed25519 public key as a trusted relayer.
+    ///
+    /// Registered relayers may contribute signatures to `fund_c_address_crosschain`.
+    /// Adding the same public key twice is idempotent.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` (`BytesN<32>`) — Ed25519 public key of the relayer.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1948,6 +3156,25 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Removes a relayer from the trusted set.
+    ///
+    /// The removal is rejected if it would reduce the active relayer count
+    /// below the current threshold, which would make cross-chain funding
+    /// impossible.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` (`BytesN<32>`) — Ed25519 public key of the relayer to remove.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::BelowThreshold`] — Removing this relayer would drop the
+    ///   count below the required threshold.
     pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1961,6 +3188,22 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Sets the minimum number of relayer signatures required to process a
+    /// cross-chain funding event.
+    ///
+    /// # Arguments
+    ///
+    /// * `threshold` (`u32`) — Must be ≤ the current number of registered relayers.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is greater than
+    ///   the number of registered relayers.
     pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -1972,18 +3215,84 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the current M-of-N relayer signature threshold.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_relayer_threshold(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(relayer_threshold(&env))
     }
 
+    /// Returns `true` if `pubkey` is a registered relayer.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` (`BytesN<32>`) — Ed25519 public key to check.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_relayer(env: Env, pubkey: BytesN<32>) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
         Ok(is_relayer(&env, &pubkey))
     }
 
-    // --- Timelocked Funding ---
+    // -----------------------------------------------------------------------
+    // Timelocked funding
+    // -----------------------------------------------------------------------
 
+    /// Creates a time-gated funding record.
+    ///
+    /// Transfers `amount` from `source` into the contract immediately. The
+    /// tokens remain locked until `release_time`, at which point `target` may
+    /// call `claim_timelocked` to receive the net amount (after fee deduction).
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address depositing the tokens. Must authorise.
+    /// * `target` (`Address`) — The address that may claim the tokens after
+    ///   `release_time`.
+    /// * `asset` (`Address`) — The whitelisted token contract.
+    /// * `amount` (`i128`) — Gross amount to lock. Must be > 0.
+    /// * `release_time` (`u64`) — Unix timestamp (seconds) after which the
+    ///   tokens may be claimed. Must be strictly in the future.
+    /// * `cliff_time` (`u64`) — Optional cliff timestamp. If > 0 it must be
+    ///   ≤ `release_time`. Currently informational only; not enforced by
+    ///   `claim_timelocked`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Returns
+    ///
+    /// The numeric ID of the newly created timelock entry. Use this ID with
+    /// `claim_timelocked` and `query_timelocked`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::InvalidReleaseTime`] — `release_time` ≤ current timestamp,
+    ///   or `cliff_time > release_time`.
+    /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
+    ///   is not allowlisted.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    ///
+    /// # Events
+    ///
+    /// * `("TimelockCreated", source, target)` — data:
+    ///   `(id, amount, asset, release_time, cliff_time)`
+    ///
+    /// # Security Considerations
+    ///
+    /// The fee rate applied is the rate at **claim time**, not deposit time.
+    /// If the global fee rate changes between deposit and claim, the net amount
+    /// received by `target` may differ from the amount at deposit time.
     pub fn fund_c_address_timelocked(
         env: Env,
         source: Address,
@@ -2035,6 +3344,38 @@ impl OnboardingBridge {
         Ok(id)
     }
 
+    /// Claims a matured timelock entry, releasing the net tokens to `target`.
+    ///
+    /// The effective fee at the time of claiming is deducted from `amount` and
+    /// the net is transferred to `target`. The timelock entry is marked
+    /// `claimed = true` to prevent double-claims.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The timelock entry ID returned by `fund_c_address_timelocked`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `target.require_auth()` (the recipient of the timelock entry).
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
+    /// * [`BridgeError::TimelockNotMatured`] — `release_time` has not passed yet.
+    /// * [`BridgeError::Unauthorized`] — The entry has already been claimed.
+    ///
+    /// # Events
+    ///
+    /// * `("TimelockClaimed", target)` — data: `(id, net_amount, fee, asset)`
+    ///
+    /// # Security Considerations
+    ///
+    /// The `claimed` flag is persisted before the token transfer. Because
+    /// Soroban execution is single-threaded within a ledger, this effectively
+    /// prevents re-entrancy. The fee rate is the **current** global rate at
+    /// claim time, which may differ from the rate at deposit time.
     pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -2073,12 +3414,43 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the timelock entry for `id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The timelock entry ID.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
     pub fn query_timelocked(env: Env, id: u64) -> Result<TimelockEntry, BridgeError> {
         read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)
     }
 
-    // --- TTL Management ---
+    // -----------------------------------------------------------------------
+    // TTL management
+    // -----------------------------------------------------------------------
 
+    /// Extends the instance-storage TTL to ensure contract state does not expire.
+    ///
+    /// `ttl` is capped at `MAX_ALLOWED_TTL` (3 110 400 ledgers, ~1 year).
+    /// The threshold used to trigger extension is `ttl / 4`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    ///
+    /// # Events
+    ///
+    /// * `("InstanceTtlExtended",)` — data: `(admin, actual_ttl)`
     pub fn extend_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -2096,6 +3468,29 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Extends the persistent-storage TTL for the three per-asset counter keys
+    /// (`AccruedFees`, `TotalBridged`, `TotalFeesCollected`) of `key_asset`.
+    ///
+    /// Only keys that already exist in storage are extended; missing keys are
+    /// silently skipped.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_asset` (`Address`) — The asset whose persistent counters should
+    ///   have their TTL extended.
+    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    ///
+    /// # Events
+    ///
+    /// * `("PersistentTtlExtended",)` — data: `(admin, key_asset, actual_ttl)`
     pub fn extend_persistent_ttl(
         env: Env,
         key_asset: Address,
@@ -2128,6 +3523,22 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Overrides the maximum instance-storage TTL used by the internal
+    /// `extend_instance_ttl` helper called on every mutating operation.
+    ///
+    /// Values above `MAX_ALLOWED_TTL` are silently capped.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` (`u32`) — New maximum in ledgers.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -2144,6 +3555,21 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Overrides the maximum persistent-storage TTL used by `extend_persistent_ttl`.
+    ///
+    /// Values above `MAX_ALLOWED_TTL` are silently capped.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` (`u32`) — New maximum in ledgers.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn set_max_persistent_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
@@ -2160,6 +3586,20 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Returns the four TTL configuration values.
+    ///
+    /// # Returns
+    ///
+    /// `(max_instance_ttl, max_persistent_ttl, hard_ceiling, critical_threshold)`
+    /// where:
+    /// - `max_instance_ttl` — current configurable max for instance storage
+    /// - `max_persistent_ttl` — current configurable max for persistent storage
+    /// - `hard_ceiling` — `MAX_ALLOWED_TTL` constant (3 110 400 ledgers)
+    /// - `critical_threshold` — `CRITICAL_ENTRY_TTL_THRESHOLD` (100 000 ledgers)
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_ttl_config(env: Env) -> Result<(u32, u32, u32, u32), BridgeError> {
         check_initialized(&env)?;
         Ok((
@@ -2170,22 +3610,63 @@ impl OnboardingBridge {
         ))
     }
 
-    // --- Issue #95: Replay protection for Soroban authorization entries ---
+    // -----------------------------------------------------------------------
+    // Auth-entry replay protection (issue #95)
+    // -----------------------------------------------------------------------
 
-    /// Validate and consume a Soroban authorization-entry nonce.
+    /// Validates and permanently consumes a Soroban authorization-entry nonce.
     ///
-    /// This prevents signature / authorization-entry reuse attacks by:
-    /// - Binding the nonce to this contract's own storage (contract ID scoping is
-    ///   implicit — nonces live in this contract's persistent storage).
-    /// - Enforcing a ledger-sequence window so stale entries cannot be replayed.
-    /// - Recording the `(source, nonce)` pair as permanently used.
-    /// - Emitting an `AuthUsed(source, nonce)` event for off-chain tracking.
+    /// This prevents Soroban authorization-entry reuse attacks by:
     ///
-    /// Parameters
-    /// - `source`              : the address whose authorization entry is being consumed
-    /// - `nonce`               : the caller-supplied nonce (must be unused)
-    /// - `valid_after_ledger`  : inclusive lower bound on the current ledger sequence
-    /// - `valid_before_ledger` : exclusive upper bound on the current ledger sequence
+    /// 1. Requiring the current ledger sequence to be within
+    ///    `[valid_after_ledger, valid_before_ledger)`.
+    /// 2. Checking that `(source, nonce)` has not been used before.
+    /// 3. Permanently marking the pair as used in persistent storage.
+    /// 4. Emitting `AuthUsed(source, nonce)` for off-chain tracking.
+    ///
+    /// The nonce is scoped to this contract's own persistent storage, so the
+    /// same numeric nonce may be used with a different contract without conflict.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address whose authorization entry is consumed.
+    /// * `nonce` (`u64`) — The nonce to burn. Must not have been used before.
+    /// * `valid_after_ledger` (`u32`) — Inclusive lower bound on the current
+    ///   ledger sequence number.
+    /// * `valid_before_ledger` (`u32`) — Exclusive upper bound on the current
+    ///   ledger sequence number.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::AuthNonceExpired`] — Current ledger sequence is outside
+    ///   the `[valid_after_ledger, valid_before_ledger)` window.
+    /// * [`BridgeError::AuthNonceAlreadyUsed`] — This `(source, nonce)` pair has
+    ///   already been consumed.
+    ///
+    /// # Events
+    ///
+    /// * `("AuthUsed", source)` — data: `(nonce,)`
+    ///
+    /// # Security Considerations
+    ///
+    /// The window `[valid_after_ledger, valid_before_ledger)` should be kept
+    /// narrow (e.g. current ledger ± a few hundred blocks) to minimise the
+    /// replay window. Once consumed, a `(source, nonce)` pair can never be
+    /// re-used regardless of how much time passes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // let nonce = bridge.query_auth_nonce(&source);
+    /// // let seq = env.ledger().sequence();
+    /// // bridge.verify_auth_entry(&source, &nonce, &seq, &(seq + 100));
+    /// ```
     pub fn verify_auth_entry(
         env: Env,
         source: Address,
@@ -2200,19 +3681,42 @@ impl OnboardingBridge {
         consume_auth_nonce(&env, &source, nonce, valid_after_ledger, valid_before_ledger)
     }
 
-    /// Query the next expected auth nonce for `source`.
+    /// Returns the next unused auth nonce for `source`.
     ///
-    /// Returns the lowest nonce value that has not yet been used for `source`.
-    /// Callers should use this value when constructing a new authorization entry.
+    /// This is the lowest nonce value that has not yet been consumed for this
+    /// address. Callers should use this value when constructing a new
+    /// authorization entry to pass to `verify_auth_entry`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address to query.
     pub fn query_auth_nonce(env: Env, source: Address) -> u64 {
         read_auth_nonce(&env, &source)
     }
 
-    /// Query whether a specific auth nonce has already been used for `source`.
+    /// Returns `true` if a specific auth nonce has already been consumed for `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address to query.
+    /// * `nonce` (`u64`) — The nonce to check.
     pub fn query_auth_nonce_used(env: Env, source: Address, nonce: u64) -> bool {
         is_auth_nonce_used(&env, &source, nonce)
     }
 
+    /// Returns the accrued (pending, not yet withdrawn) fee balance for `asset`.
+    ///
+    /// Accrued fees accumulate on every `fund_c_address` call and are
+    /// decremented when `withdraw_fees` is called. This value is always
+    /// ≤ `query_fee_balance` (the contract's actual token balance).
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The token to query.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_accrued_fees(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_accrued_fees(&env, &asset))
