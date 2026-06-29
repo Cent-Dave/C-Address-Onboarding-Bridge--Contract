@@ -83,6 +83,8 @@ pub enum DataKey {
     CurrentWasmHash,
     // Issue #21: two-phase admin transfer
     PendingAdmin,
+    // Issue #22: two-phase fee collector transfer
+    PendingFeeCollector,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -195,6 +197,18 @@ fn read_pending_admin(env: &Env) -> Option<Address> {
 
 fn clear_pending_admin(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingAdmin);
+}
+
+fn save_pending_fee_collector(env: &Env, addr: &Address) {
+    env.storage().instance().set(&DataKey::PendingFeeCollector, addr);
+}
+
+fn read_pending_fee_collector(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::PendingFeeCollector)
+}
+
+fn clear_pending_fee_collector(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingFeeCollector);
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
@@ -1102,6 +1116,38 @@ impl OnboardingBridge {
         env.events()
             .publish(("FeeCollectorChanged", old_collector, new_fee_collector), (config.admin,));
         Ok(())
+    }
+
+    pub fn propose_new_fee_collector(env: Env, new_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_pending_fee_collector(&env, &new_collector);
+        env.events()
+            .publish(("FeeCollectorTransferProposed", admin, new_collector), ());
+        Ok(())
+    }
+
+    pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
+        pending.require_auth();
+        let old_collector = read_fee_collector(&env);
+        save_fee_collector(&env, &pending);
+        let mut config = read_bridge_config(&env);
+        config.fee_collector = pending.clone();
+        save_bridge_config(&env, &config);
+        clear_pending_fee_collector(&env);
+        env.events()
+            .publish(("FeeCollectorTransferred", old_collector, pending), ());
+        Ok(())
+    }
+
+    pub fn query_pending_fee_collector(env: Env) -> Option<Address> {
+        read_pending_fee_collector(&env)
     }
 
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
