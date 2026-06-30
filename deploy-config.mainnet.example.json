@@ -1,0 +1,9 @@
+{
+  "network": "mainnet",
+  "rpcUrl": "https://mainnet.sorobanrpc.com",
+  "networkPassphrase": "Public Global Stellar Network ; September 2015",
+  "adminSecretKey": "S...YOUR_ADMIN_SECRET_KEY",
+  "feeCollectorPublicKey": "G...YOUR_FEE_COLLECTOR_PUBLIC_KEY",
+  "feeBps": 50,
+  "wasmPath": "./target/wasm32-unknown-unknown/release/onboarding_bridge.wasm"
+}

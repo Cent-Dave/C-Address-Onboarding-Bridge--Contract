@@ -1,3 +1,13 @@
+/**
+ * @fileoverview Main SDK class for the C-Address Onboarding Bridge contract.
+ *
+ * {@link OnboardingBridgeSDK} wraps every public contract function in a
+ * TypeScript method that handles account lookup, transaction building,
+ * simulation, signing, submission, and automatic RPC retries.
+ *
+ * @module bridge
+ */
+
 import {
   BridgeConfig,
   FundCOptions,
@@ -30,12 +40,64 @@ import {
   BASE_FEE,
 } from '@stellar/stellar-sdk';
 
+/**
+ * TypeScript SDK for the C-Address Onboarding Bridge Soroban contract.
+ *
+ * Provides typed wrappers around every contract function.  Mutating methods
+ * return a {@link TransactionResult} and never throw — errors are surfaced
+ * through `result.status === 'failed'`.  Read-only query methods throw on
+ * RPC or contract error so you can use standard `try/catch` patterns.
+ *
+ * All RPC calls are automatically retried on transient network failures using
+ * exponential backoff with full jitter (see {@link withRpcRetry}).  The retry
+ * policy is configurable via `BridgeConfig.retry`.
+ *
+ * @example
+ * ```ts
+ * import { OnboardingBridgeSDK } from '@stellar/c-address-onboarding-bridge-sdk';
+ * import { Keypair, Networks } from '@stellar/stellar-sdk';
+ *
+ * const sdk = new OnboardingBridgeSDK({
+ *   contractId: 'CA...',
+ *   rpcUrl: 'https://soroban-testnet.stellar.org',
+ *   networkPassphrase: Networks.TESTNET,
+ * });
+ *
+ * const keypair = Keypair.fromSecret(process.env.SECRET!);
+ * const result = await sdk.fundCAddress(
+ *   { source: keypair.publicKey(), target: 'CC...', asset: 'CD...', amount: '1000000' },
+ *   keypair,
+ * );
+ * if (result.status === 'failed') console.error(result.error);
+ * ```
+ */
 export class OnboardingBridgeSDK {
   private config: BridgeConfig;
   private contract: Contract;
   private provider: SorobanRpc.Server;
   private networkPassphrase: string;
 
+  /**
+   * Create a new SDK instance.
+   *
+   * Validates `config.contractId` immediately and throws if it is not a valid
+   * Stellar C-address.  No network call is made during construction.
+   *
+   * @param config - SDK configuration: contract ID, RPC URL, network passphrase,
+   *                 and optional timeout / retry settings.
+   *
+   * @throws {Error} If `config.contractId` is not a valid contract address.
+   *
+   * @example
+   * ```ts
+   * const sdk = new OnboardingBridgeSDK({
+   *   contractId: 'CA...',
+   *   rpcUrl: 'https://soroban-testnet.stellar.org',
+   *   networkPassphrase: Networks.TESTNET,
+   *   retry: { maxRetries: 5 },
+   * });
+   * ```
+   */
   constructor(config: BridgeConfig) {
     assertContractAddress(config.contractId, 'contractId');
     this.config = config;
@@ -51,8 +113,43 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Fund a C-address from a source account.
-   * The source must have authorized the token transfer to the bridge contract.
+   * Fund a single C-address from a source G-address.
+   *
+   * Transfers `options.amount` of `options.asset` from `source` into the
+   * bridge contract, deducts the protocol fee, and forwards the net amount to
+   * `target`.  The source account must authorise the token transfer — this is
+   * handled automatically by Soroban's `require_auth` mechanism when the
+   * transaction is signed with `sourceKeypair`.
+   *
+   * @param options      - Transfer parameters: source, target, asset, amount.
+   * @param sourceKeypair - Keypair of the source account.  Used to sign the
+   *                        transaction.  Must correspond to `options.source`.
+   *
+   * @returns A {@link TransactionResult} with `status: 'pending'` on successful
+   *          submission, or `status: 'failed'` with an `error` message.
+   *          Poll `SorobanRpc.Server.getTransaction(result.hash)` to confirm
+   *          finality before showing success to the user.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * const result = await sdk.fundCAddress(
+   *   {
+   *     source: keypair.publicKey(),
+   *     target: 'CC...',
+   *     asset:  'CD...usdc',
+   *     amount: '10000000', // 1 USDC (7 decimal places)
+   *   },
+   *   keypair,
+   * );
+   *
+   * if (result.status === 'failed') {
+   *   console.error('Transfer failed:', result.error);
+   * } else {
+   *   console.log('Submitted tx:', result.hash);
+   * }
+   * ```
    */
   async fundCAddress(
     options: FundCOptions,
@@ -177,7 +274,36 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Batch fund multiple C-addresses from a single source in one transaction.
+   * Fund multiple C-addresses from a single source account in one transaction.
+   *
+   * The source is charged the sum of all `options.amounts` up front.  For each
+   * target that fails access control (blocked, not allowlisted), the
+   * corresponding amount is refunded to `source` and a `BatchTransferFailed`
+   * event is emitted.  A `BatchCompleted` event is emitted at the end with
+   * aggregate totals.
+   *
+   * `options.targets` and `options.amounts` must be the same length.
+   *
+   * @param options       - Batch transfer parameters: source, targets, amounts, asset.
+   * @param sourceKeypair - Keypair of the source account used to sign the transaction.
+   *
+   * @returns A {@link TransactionResult} with `status: 'pending'` on successful
+   *          submission, or `status: 'failed'` with an error message.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * const result = await sdk.batchFundCAddresses(
+   *   {
+   *     source:  keypair.publicKey(),
+   *     targets: ['CC...1', 'CC...2', 'CC...3'],
+   *     amounts: ['5000000', '3000000', '2000000'],
+   *     asset:   'CD...usdc',
+   *   },
+   *   keypair,
+   * );
+   * ```
    */
   async batchFundCAddresses(
     options: BatchFundCOptions,
@@ -226,8 +352,27 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Withdraw accumulated fees from the bridge contract.
-   * Only the fee collector can call this.
+   * Withdraw accumulated protocol fees from the bridge contract.
+   *
+   * Only the configured fee-collector address may call this method.  Fees
+   * accumulate in the contract after every successful `fund_c_address` or
+   * `batch_fund_c_address` call.
+   *
+   * @param options            - Asset and amount to withdraw.
+   * @param feeCollectorKeypair - Keypair of the fee-collector account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * const balance = await sdk.getFeeBalance('CD...usdc');
+   * const result  = await sdk.withdrawFees(
+   *   { asset: 'CD...usdc', amount: balance },
+   *   feeCollectorKeypair,
+   * );
+   * ```
    */
   async withdrawFees(
     options: WithdrawFeesOptions,
@@ -271,7 +416,25 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Reclaim tokens accidentally sent to the contract (admin only).
+   * Reclaim tokens accidentally sent directly to the bridge contract address.
+   *
+   * Admin only.  This is an emergency recovery tool — it moves the contract's
+   * raw token balance (minus any accrued fees for that asset) to `options.to`.
+   *
+   * @param options     - Asset, amount, and destination address.
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.reclaimTokens(
+   *   { asset: 'CD...', amount: '1000000', to: 'G...safeAddress' },
+   *   adminKeypair,
+   * );
+   * ```
    */
   async reclaimTokens(
     options: ReclaimTokensOptions,
@@ -316,7 +479,20 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the current fee in basis points.
+   * Get the current protocol fee in basis points (bps).
+   *
+   * 1 bps = 0.01%, so `50` means a 0.5% fee is deducted from each transfer.
+   * The maximum allowed value is 1000 (10%).
+   *
+   * @returns The fee in basis points as a `number`.
+   *
+   * @throws {Error} On RPC failure or contract error.
+   *
+   * @example
+   * ```ts
+   * const feeBps = await sdk.getFee();
+   * console.log(`Current fee: ${feeBps / 100}%`);
+   * ```
    */
   async getFee(): Promise<number> {
     const result = await this.provider
@@ -333,7 +509,19 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the fee collector address.
+   * Get the current fee-collector G-address.
+   *
+   * The fee collector is the only account authorised to call `withdrawFees`.
+   *
+   * @returns The fee-collector G-address as a string.
+   *
+   * @throws {Error} On RPC failure or contract error.
+   *
+   * @example
+   * ```ts
+   * const collector = await sdk.getFeeCollector();
+   * console.log('Fee collector:', collector);
+   * ```
    */
   async getFeeCollector(): Promise<string> {
     const result = await this.provider
@@ -350,7 +538,20 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the admin address.
+   * Get the current admin G-address.
+   *
+   * The admin account is authorised to update fee rates, fee collector, admin
+   * address, asset whitelist, access control lists, and to upgrade the contract.
+   *
+   * @returns The admin G-address as a string.
+   *
+   * @throws {Error} On RPC failure or contract error.
+   *
+   * @example
+   * ```ts
+   * const admin = await sdk.getAdmin();
+   * console.log('Admin:', admin);
+   * ```
    */
   async getAdmin(): Promise<string> {
     const result = await this.provider
@@ -367,7 +568,21 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Query the balance of a C-address for a given asset.
+   * Query the token balance of any address (G-address or C-address) for a
+   * given asset, using the bridge contract's `query_balance` view function.
+   *
+   * @param cAddress - The address to query (G-address or C-address).
+   * @param asset    - Token contract address to check the balance for.
+   *
+   * @returns The balance in the token's smallest unit as a decimal string.
+   *
+   * @throws {Error} If either address is invalid or on RPC failure.
+   *
+   * @example
+   * ```ts
+   * const balance = await sdk.getCAddressBalance('CC...', 'CD...usdc');
+   * console.log('Balance:', balance); // e.g. '10000000' = 1 USDC
+   * ```
    */
   async getCAddressBalance(
     cAddress: string,
@@ -389,7 +604,22 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the fee balance held by the contract for a given asset.
+   * Get the accumulated (uncollected) fee balance held by the contract for a
+   * specific asset.
+   *
+   * Use this before calling `withdrawFees` to know the exact withdrawable amount.
+   *
+   * @param asset - Token contract address.
+   *
+   * @returns The accrued fee balance in the token's smallest unit as a string.
+   *
+   * @throws {Error} If `asset` is not a valid contract address or on RPC failure.
+   *
+   * @example
+   * ```ts
+   * const fees = await sdk.getFeeBalance('CD...usdc');
+   * console.log('Uncollected fees:', fees);
+   * ```
    */
   async getFeeBalance(asset: string): Promise<string> {
     assertContractAddress(asset, 'asset');
@@ -407,8 +637,23 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get all token balances held by the contract for the given assets.
-   * Returns a map of asset address → balance string.
+   * Get the contract's token balances for multiple assets in a single RPC call.
+   *
+   * Returns a plain object mapping each asset contract address to its balance
+   * string.  Useful for dashboard or monitoring use-cases.
+   *
+   * @param assets - Array of token contract addresses to query.
+   *
+   * @returns A `Record<assetAddress, balanceString>`.
+   *          Assets with a zero balance are included with value `'0'`.
+   *
+   * @throws {Error} If any address in `assets` is invalid or on RPC failure.
+   *
+   * @example
+   * ```ts
+   * const balances = await sdk.getAllBalances(['CD...usdc', 'CD...xlm']);
+   * // { 'CD...usdc': '1200000', 'CD...xlm': '500000000' }
+   * ```
    */
   async getAllBalances(assets: string[]): Promise<Record<string, string>> {
     assets.forEach((a, i) => assertContractAddress(a, `assets[${i}]`));
@@ -433,7 +678,21 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Check if the bridge contract is initialized.
+   * Check whether the bridge contract has been initialized.
+   *
+   * The contract must be initialized (via `initialize`) before any funding
+   * operations are permitted.  Use this after deployment to verify the contract
+   * is ready for use.
+   *
+   * @returns `true` if the contract has been initialized, `false` otherwise.
+   *
+   * @throws {Error} On RPC failure.
+   *
+   * @example
+   * ```ts
+   * const ready = await sdk.isInitialized();
+   * if (!ready) throw new Error('Contract not initialized yet');
+   * ```
    */
   async isInitialized(): Promise<boolean> {
     const result = await this.provider
@@ -450,7 +709,22 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Set the fee in basis points (admin only).
+   * Update the protocol fee rate (admin only).
+   *
+   * The new fee takes effect on the next `fund_c_address` call.
+   * Maximum allowed value is 1000 bps (10%).
+   *
+   * @param newFeeBps   - New fee in basis points (0–1000).
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.setFee(75, adminKeypair); // set to 0.75%
+   * ```
    */
   async setFee(
     newFeeBps: number,
@@ -493,7 +767,22 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Set the fee collector address (admin only).
+   * Rotate the fee-collector address (admin only).
+   *
+   * The new fee collector immediately gains the right to call `withdrawFees`.
+   * The old fee collector loses it.
+   *
+   * @param newFeeCollector - G-address of the new fee collector.
+   * @param adminKeypair    - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.setFeeCollector('G...newCollector', adminKeypair);
+   * ```
    */
   async setFeeCollector(
     newFeeCollector: string,
@@ -537,7 +826,23 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Set the admin address (admin only).
+   * Transfer the admin role to a new G-address (admin only).
+   *
+   * After this call the old admin loses all privileged access.  Ensure the new
+   * admin keypair is accessible before calling this — there is no recovery path
+   * if the new admin key is lost.
+   *
+   * @param newAdmin     - G-address of the new admin.
+   * @param adminKeypair - Keypair of the current admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.setAdmin('G...newAdmin', adminKeypair);
+   * ```
    */
   async setAdmin(
     newAdmin: string,
@@ -679,7 +984,20 @@ export class OnboardingBridgeSDK {
     }
   }
 
-  /** Register an Ed25519 relayer pubkey (admin only). */
+  /** 
+   * Register an Ed25519 relayer public key on the contract (admin only).
+   *
+   * Registered relayers are authorised to submit attestation signatures for
+   * cross-chain events via `fundCrosschain`.  After adding, update the threshold
+   * with `setRelayerThreshold` if needed.
+   *
+   * @param options      - Contains the 32-byte Ed25519 pubkey as a hex string.
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
   async addRelayer(options: RelayerManagementOptions, adminKeypair: Keypair): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
@@ -696,7 +1014,20 @@ export class OnboardingBridgeSDK {
     }
   }
 
-  /** Remove an Ed25519 relayer pubkey (admin only). */
+  /**
+   * Remove a previously registered Ed25519 relayer public key (admin only).
+   *
+   * The removed key can no longer contribute valid signatures for cross-chain
+   * attestations.  Ensure the remaining relayer set still meets the threshold
+   * or lower the threshold first.
+   *
+   * @param options      - Contains the 32-byte Ed25519 pubkey as a hex string.
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
   async removeRelayer(options: RelayerManagementOptions, adminKeypair: Keypair): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
@@ -713,7 +1044,25 @@ export class OnboardingBridgeSDK {
     }
   }
 
-  /** Set the M-of-N relayer threshold (admin only). Must not exceed total relayer count. */
+  /**
+   * Set the M-of-N relayer threshold (admin only).
+   *
+   * Cross-chain attestations require at least `threshold` valid signatures from
+   * registered relayers.  Must not exceed the total number of registered relayers.
+   *
+   * @param threshold    - Minimum number of valid relayer signatures required.
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * // Require 2-of-3 relayers
+   * await sdk.setRelayerThreshold(2, adminKeypair);
+   * ```
+   */
   async setRelayerThreshold(threshold: number, adminKeypair: Keypair): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
@@ -730,7 +1079,13 @@ export class OnboardingBridgeSDK {
     }
   }
 
-  /** Query the current relayer threshold (M in M-of-N). */
+  /**
+   * Query the current M-of-N relayer threshold.
+   *
+   * @returns The threshold as a `number` (M in M-of-N).
+   *
+   * @throws {Error} On RPC failure.
+   */
   async queryRelayerThreshold(): Promise<number> {
     const result = await this.provider.simulateTransaction(
       this.buildSimulationTx('query_relayer_threshold', []),
@@ -743,8 +1098,29 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Create a new C-address (smart contract account) using Soroban's create_contract.
-   * Optionally funds the C-address immediately after creation.
+   * Create a new Soroban smart-contract account (C-address).
+   *
+   * Calls the bridge contract's `create_contract` helper which deploys a new
+   * account contract and derives its C-address from the deployer's address and
+   * an optional salt.  If `options.initialFunds` is provided, a `fund_c_address`
+   * call is made immediately after creation so the new account has a starting
+   * balance.
+   *
+   * @param options - Deployer keypair, optional deterministic salt, and optional
+   *                  initial funding parameters.
+   *
+   * @returns A {@link CreateCAddressResult} with the new C-address and creation tx hash.
+   *
+   * @throws {Error} If contract creation or the subsequent fund call fails.
+   *
+   * @example
+   * ```ts
+   * const { cAddress, txHash } = await sdk.createCAddress({
+   *   deployerKeypair: keypair,
+   *   initialFunds: { asset: 'CD...usdc', amount: '10000000' },
+   * });
+   * console.log('New C-address:', cAddress);
+   * ```
    */
   async createCAddress(
     options: CreateCOptions,
@@ -835,7 +1211,15 @@ export class OnboardingBridgeSDK {
     };
   }
 
-  /** Query whether a given Ed25519 pubkey (hex) is a registered relayer. */
+  /**
+   * Check whether a given Ed25519 public key is a registered relayer.
+   *
+   * @param pubkeyHex - 32-byte Ed25519 public key as a lowercase hex string.
+   *
+   * @returns `true` if the pubkey is registered, `false` otherwise.
+   *
+   * @throws {Error} On RPC failure.
+   */
   async queryIsRelayer(pubkeyHex: string): Promise<boolean> {
     const result = await this.provider.simulateTransaction(
       this.buildSimulationTx('query_is_relayer', [Buffer.from(pubkeyHex, 'hex')]),
@@ -888,7 +1272,15 @@ export class OnboardingBridgeSDK {
   /**
    * Return a paginated list of whitelisted asset contract addresses.
    *
-   * Soroban contracts return full vectors; pagination is applied client-side.
+   * Only whitelisted assets can be used in `fundCAddress` and batch calls.
+   * The full list is fetched from the contract and paginated client-side.
+   *
+   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
+   * @param limit  - Maximum items per page.  Defaults to 20.
+   *
+   * @returns A {@link PaginatedResult} containing asset C-addresses for this page.
+   *
+   * @throws {Error} On RPC failure.
    *
    * @example
    * ```ts
@@ -918,9 +1310,16 @@ export class OnboardingBridgeSDK {
   /**
    * Return a paginated list of fee-exempt addresses.
    *
-   * Fee-exempt addresses are stored individually in contract storage under
-   * `DataKey::FeeExempt(address)`. The SDK queries the full list via
-   * `query_fee_exempt_addresses` and paginates client-side.
+   * Fee-exempt addresses pay zero protocol fee on every transfer regardless of
+   * the configured `fee_bps`.  The full list is fetched from the contract and
+   * paginated client-side.
+   *
+   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
+   * @param limit  - Maximum items per page.  Defaults to 20.
+   *
+   * @returns A {@link PaginatedResult} of address strings.
+   *
+   * @throws {Error} On RPC failure.
    */
   async getFeeExemptAddresses(
     cursor?: string,
@@ -941,6 +1340,16 @@ export class OnboardingBridgeSDK {
 
   /**
    * Return a paginated list of addresses on the blocklist.
+   *
+   * Blocklisted addresses cannot receive funds via `fundCAddress` or batch calls.
+   * Transfers to them are silently skipped (in batch) or rejected (single).
+   *
+   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
+   * @param limit  - Maximum items per page.  Defaults to 20.
+   *
+   * @returns A {@link PaginatedResult} of address strings.
+   *
+   * @throws {Error} On RPC failure.
    */
   async getBlocklistedAddresses(
     cursor?: string,
@@ -961,6 +1370,17 @@ export class OnboardingBridgeSDK {
 
   /**
    * Return a paginated list of addresses on the allowlist.
+   *
+   * When the contract is in allowlist mode, only allowlisted addresses can
+   * receive funds.  Non-allowlisted targets in batch calls are skipped and
+   * their amounts refunded to the source.
+   *
+   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
+   * @param limit  - Maximum items per page.  Defaults to 20.
+   *
+   * @returns A {@link PaginatedResult} of address strings.
+   *
+   * @throws {Error} On RPC failure.
    */
   async getAllowlistedAddresses(
     cursor?: string,
@@ -980,6 +1400,15 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Convert an array of JavaScript values to Soroban `ScVal` XDR values.
+   *
+   * Handles strings (G-/C-addresses, numeric strings, plain strings), numbers,
+   * bigints, `Address` instances, arrays (→ `scvVec`), and `null`/`undefined`
+   * (→ `scvVoid`).
+   *
+   * @param args - Values to convert.
+   * @returns Array of `xdr.ScVal` suitable for passing to `Contract.call`.
+   * @internal
    * Estimate the transaction cost for a `fundCAddress` call without submitting
    * it to the network.
    *

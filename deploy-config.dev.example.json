@@ -1,0 +1,9 @@
+{
+  "network": "dev",
+  "rpcUrl": "http://localhost:8000/soroban/rpc",
+  "networkPassphrase": "Standalone Network ; February 2017",
+  "adminSecretKey": "S...YOUR_ADMIN_SECRET_KEY",
+  "feeCollectorPublicKey": "G...YOUR_FEE_COLLECTOR_PUBLIC_KEY",
+  "feeBps": 50,
+  "wasmPath": "./target/wasm32-unknown-unknown/release/onboarding_bridge.wasm"
+}

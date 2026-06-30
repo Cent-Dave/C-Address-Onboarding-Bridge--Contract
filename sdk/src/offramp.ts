@@ -1,3 +1,14 @@
+/**
+ * @fileoverview Off-ramp and on-ramp integration helpers.
+ *
+ * {@link OffRampIntegration} builds widget URLs for MoonPay, Transak, Ramp
+ * Network, and Banxa so users can buy or sell crypto directly to/from a
+ * Stellar C-address or G-address.  It also provides CEX deposit memo helpers
+ * for routing centralized-exchange withdrawals through the bridge.
+ *
+ * @module offramp
+ */
+
 import {
   OffRampConfig,
   OffRampProvider,
@@ -7,16 +18,73 @@ import {
   ProviderComparison,
 } from './types';
 
+/**
+ * Builds on-ramp and off-ramp widget URLs for multiple fiat-to-crypto
+ * (and crypto-to-fiat) providers, and provides CEX deposit memo helpers.
+ *
+ * Construct once with your API keys and reuse across the application.
+ * All URL-building methods are synchronous — no network call is made.
+ *
+ * Supported providers: **MoonPay**, **Transak**, **Ramp Network**, **Banxa**.
+ *
+ * @example
+ * ```ts
+ * import { OffRampIntegration } from '@stellar/c-address-onboarding-bridge-sdk';
+ *
+ * const offramp = new OffRampIntegration({
+ *   moonpayApiKey: process.env.MOONPAY_KEY,
+ *   transakApiKey: process.env.TRANSAK_KEY,
+ *   testMode: process.env.NODE_ENV !== 'production',
+ * });
+ *
+ * // On-ramp: user pays $100 USD, receives XLM at their C-address
+ * const url = offramp.getOnRampUrl({
+ *   provider: 'moonpay',
+ *   amount: '100',
+ *   fiatCurrency: 'USD',
+ *   asset: 'XLM',
+ *   cAddress: 'CC...',
+ * });
+ * window.open(url);
+ * ```
+ */
 export class OffRampIntegration {
   private config: OffRampConfig;
 
+  /**
+   * Create a new OffRampIntegration instance.
+   *
+   * @param config - API keys for the providers you intend to use, and an
+   *                 optional `testMode` flag to route traffic to sandbox URLs.
+   */
   constructor(config: OffRampConfig) {
     this.config = config;
   }
 
   /**
-   * Get unified on-ramp URL builder for multiple providers.
-   * Supports funding a C-address with crypto via credit card or bank transfer.
+   * Build a widget URL for purchasing crypto with fiat (on-ramp).
+   *
+   * Redirects the user to the selected provider's checkout page where they pay
+   * with a credit card or bank transfer and receive `params.asset` at
+   * `params.cAddress` on Stellar.
+   *
+   * @param params - Provider, fiat amount, fiat currency, crypto asset, and
+   *                 destination C-address.
+   *
+   * @returns A fully-formed URL string ready for `window.open()` or a webview.
+   *
+   * @throws {Error} If `params.provider` is not one of the supported values.
+   *
+   * @example
+   * ```ts
+   * const url = offramp.getOnRampUrl({
+   *   provider: 'transak',
+   *   amount: '50',
+   *   fiatCurrency: 'EUR',
+   *   asset: 'USDC',
+   *   cAddress: 'CC...',
+   * });
+   * ```
    */
   getOnRampUrl(params: OnRampUrlParams): string {
     switch (params.provider) {
@@ -34,8 +102,28 @@ export class OffRampIntegration {
   }
 
   /**
-   * Get unified off-ramp URL builder for multiple providers.
-   * Supports selling crypto for fiat, funded from a G-address.
+   * Build a widget URL for selling crypto for fiat (off-ramp).
+   *
+   * Redirects the user to the selected provider's sell page where they send
+   * `params.asset` from `params.gAddress` and receive fiat currency.
+   *
+   * @param params - Provider, crypto amount, crypto asset, fiat currency, and
+   *                 source G-address.
+   *
+   * @returns A fully-formed URL string.
+   *
+   * @throws {Error} If `params.provider` is not one of the supported values.
+   *
+   * @example
+   * ```ts
+   * const url = offramp.getOffRampUrl({
+   *   provider: 'moonpay',
+   *   amount: '10',
+   *   asset: 'XLM',
+   *   fiatCurrency: 'USD',
+   *   gAddress: 'G...',
+   * });
+   * ```
    */
   getOffRampUrl(params: OffRampUrlParams): string {
     switch (params.provider) {
@@ -53,8 +141,22 @@ export class OffRampIntegration {
   }
 
   /**
-   * Get configuration and capabilities for a provider.
-   * Returns supported assets, countries, limits, and fees.
+   * Get the static capability configuration for a provider.
+   *
+   * Returns supported assets, fiat currencies, countries, amount limits, fee
+   * percentage, and test-mode availability.  Useful for rendering provider
+   * selection UI or filtering by user's country and preferred currency.
+   *
+   * @param provider - The provider to look up.
+   *
+   * @returns A {@link ProviderConfig} object with the provider's capabilities.
+   *
+   * @example
+   * ```ts
+   * const config = offramp.getProviderConfig('moonpay');
+   * console.log(config.supportedCountries); // ['US', 'GB', ...]
+   * console.log(config.feePercentage);      // '4.5'
+   * ```
    */
   getProviderConfig(provider: OffRampProvider): ProviderConfig {
     const configs: Record<OffRampProvider, ProviderConfig> = {
@@ -125,9 +227,25 @@ export class OffRampIntegration {
   }
 
   /**
-   * Compare providers for a given transaction.
-   * Returns fee amounts and settlement times across providers.
-   * Only includes providers that support the specified asset and fiat currency.
+   * Compare all providers for a given transaction and return fee/settlement data.
+   *
+   * Filters to providers that support both `asset` and `fiatCurrency`, then
+   * calculates the fee amount, net amount, and approximate settlement time for
+   * each.  Useful for rendering a "best rate" comparison UI.
+   *
+   * @param amount       - Gross fiat amount as a decimal string (e.g. `'100'`).
+   * @param asset        - Crypto asset code (e.g. `'XLM'`, `'USDC'`).
+   * @param fiatCurrency - ISO 4217 fiat currency code (default `'USD'`).
+   *
+   * @returns A partial record mapping each supported provider to a
+   *          {@link ProviderComparison} object.  Providers that do not support
+   *          the asset or currency are omitted.
+   *
+   * @example
+   * ```ts
+   * const results = offramp.compareProviders('100', 'XLM', 'USD');
+   * // { moonpay: { feeAmount: '4.50', netAmount: '95.50', settlementTime: 2 }, ... }
+   * ```
    */
   compareProviders(
     amount: string,
@@ -339,10 +457,24 @@ export class OffRampIntegration {
   }
 
   /**
-   * Generate a CEX (Centralized Exchange) deposit memo that encodes
-   * the target C-address so the bridge contract can route the funds.
+   * Generate a Stellar memo that encodes a target C-address for CEX routing.
    *
-   * The memo format is: "bridge:<target_c_address>"
+   * When a user withdraws from a centralized exchange to the bridge's G-address,
+   * they must include this memo so the bridge can identify the intended
+   * destination C-address.
+   *
+   * Memo format: `"bridge:<targetCAddress>"`
+   *
+   * @param targetCAddress - The C-address that should receive the bridged funds.
+   *
+   * @returns A memo string in the format `"bridge:<targetCAddress>"`.
+   *
+   * @example
+   * ```ts
+   * const memo = offramp.generateCEXDepositMemo('CC...');
+   * // → 'bridge:CC...'
+   * // User pastes this into their CEX withdrawal memo field
+   * ```
    */
   generateCEXDepositMemo(targetCAddress: string): string {
     return `bridge:${targetCAddress}`;
@@ -350,6 +482,23 @@ export class OffRampIntegration {
 
   /**
    * Decode a CEX deposit memo to extract the target C-address.
+   *
+   * Use this on the bridge relayer side when a Stellar payment arrives with a
+   * memo to determine which C-address should receive the funds.
+   *
+   * @param memo - The raw memo string from the incoming Stellar payment.
+   *
+   * @returns The extracted C-address string, or `null` if the memo is not a
+   *          valid bridge memo (i.e. does not start with `"bridge:"`).
+   *
+   * @example
+   * ```ts
+   * const target = offramp.decodeCEXDepositMemo('bridge:CC...');
+   * // → 'CC...'
+   *
+   * const invalid = offramp.decodeCEXDepositMemo('some-other-memo');
+   * // → null
+   * ```
    */
   decodeCEXDepositMemo(memo: string): string | null {
     if (!memo.startsWith('bridge:')) {
