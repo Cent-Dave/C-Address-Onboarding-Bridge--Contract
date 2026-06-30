@@ -260,3 +260,34 @@ export interface PaginationOptions {
   /** Maximum items to return per page (default: 20) */
   limit?: number;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #58: Transaction cost estimation
+// ---------------------------------------------------------------------------
+
+/**
+ * Estimated cost for a `fundCAddress` transaction.
+ * All fee values are in stroops (1 XLM = 10_000_000 stroops).
+ */
+export interface CostEstimate {
+  /**
+   * Inclusion fee (base network fee) in stroops.
+   * This is the minimum fee required for the transaction to be included.
+   */
+  fee: string;
+  /**
+   * Minimum account balance required to submit the transaction, in stroops.
+   * Accounts below this balance cannot submit transactions.
+   */
+  minBalance: string;
+  /**
+   * Soroban resource fee in stroops (covers CPU, memory, storage, I/O).
+   * This is on top of the inclusion fee.
+   */
+  resourceFee: string;
+  /**
+   * Wall-clock time the simulation took, in milliseconds.
+   * Useful for UI feedback — if this is high, the RPC may be under load.
+   */
+  executionTimeMs: number;
+}

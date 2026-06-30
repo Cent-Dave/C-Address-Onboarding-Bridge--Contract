@@ -16,4 +16,24 @@ export type {
   RetryLogger,
   RetryableClassifier,
 } from './retry';
+
+// Issue #57: Event subscription
+export { EventSubscriber } from './events';
+export type {
+  BridgeEventName,
+  BridgeEventPayload,
+  BridgeEventCallback,
+  BridgeEventMap,
+  EventSubscriberConfig,
+  Unsubscribe,
+  CAddressFundedEvent,
+  FeesWithdrawnEvent,
+  AdminChangedEvent,
+  MetaFundExecutedEvent,
+  GenericBridgeEvent,
+} from './events';
+
+// Issue #58: Cost estimation
+export type { CostEstimate } from './types';
+
 export * from './types';
