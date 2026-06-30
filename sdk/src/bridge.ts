@@ -18,6 +18,7 @@ import {
   xdr,
   Address,
   Account,
+  Keypair,
   nativeToScVal,
   scValToNative,
   TransactionBuilder,
@@ -44,7 +45,7 @@ export class OnboardingBridgeSDK {
    */
   async fundCAddress(
     options: FundCOptions,
-    sourceKeypair: any,
+    sourceKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       assertAccountAddress(options.source, 'source');
@@ -93,7 +94,7 @@ export class OnboardingBridgeSDK {
    */
   async batchFundCAddresses(
     options: BatchFundCOptions,
-    sourceKeypair: any,
+    sourceKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       assertAccountAddress(options.source, 'source');
@@ -143,7 +144,7 @@ export class OnboardingBridgeSDK {
    */
   async withdrawFees(
     options: WithdrawFeesOptions,
-    feeCollectorKeypair: any,
+    feeCollectorKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       assertContractAddress(options.asset, 'asset');
@@ -187,7 +188,7 @@ export class OnboardingBridgeSDK {
    */
   async reclaimTokens(
     options: ReclaimTokensOptions,
-    adminKeypair: any,
+    adminKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       assertContractAddress(options.asset, 'asset');
@@ -366,7 +367,7 @@ export class OnboardingBridgeSDK {
    */
   async setFee(
     newFeeBps: number,
-    adminKeypair: any,
+    adminKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(
@@ -409,7 +410,7 @@ export class OnboardingBridgeSDK {
    */
   async setFeeCollector(
     newFeeCollector: string,
-    adminKeypair: any,
+    adminKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       assertAccountAddress(newFeeCollector, 'newFeeCollector');
@@ -453,7 +454,7 @@ export class OnboardingBridgeSDK {
    */
   async setAdmin(
     newAdmin: string,
-    adminKeypair: any,
+    adminKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       assertAccountAddress(newAdmin, 'newAdmin');
@@ -499,7 +500,7 @@ export class OnboardingBridgeSDK {
    */
   async upgrade(
     options: UpgradeOptions,
-    adminKeypair: any,
+    adminKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(
@@ -545,7 +546,7 @@ export class OnboardingBridgeSDK {
    */
   async fundCrosschain(
     options: CrossChainFundOptions,
-    relayerKeypair: any,
+    relayerKeypair: Keypair,
   ): Promise<TransactionResult> {
     try {
       const relayerAccount = await this.provider.getAccount(relayerKeypair.publicKey());
@@ -592,7 +593,7 @@ export class OnboardingBridgeSDK {
   }
 
   /** Register an Ed25519 relayer pubkey (admin only). */
-  async addRelayer(options: RelayerManagementOptions, adminKeypair: any): Promise<TransactionResult> {
+  async addRelayer(options: RelayerManagementOptions, adminKeypair: Keypair): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
       const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
@@ -609,7 +610,7 @@ export class OnboardingBridgeSDK {
   }
 
   /** Remove an Ed25519 relayer pubkey (admin only). */
-  async removeRelayer(options: RelayerManagementOptions, adminKeypair: any): Promise<TransactionResult> {
+  async removeRelayer(options: RelayerManagementOptions, adminKeypair: Keypair): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
       const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
@@ -626,7 +627,7 @@ export class OnboardingBridgeSDK {
   }
 
   /** Set the M-of-N relayer threshold (admin only). Must not exceed total relayer count. */
-  async setRelayerThreshold(threshold: number, adminKeypair: any): Promise<TransactionResult> {
+  async setRelayerThreshold(threshold: number, adminKeypair: Keypair): Promise<TransactionResult> {
     try {
       const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
       const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
