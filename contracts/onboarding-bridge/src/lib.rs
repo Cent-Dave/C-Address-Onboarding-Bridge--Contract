@@ -4212,6 +4212,12 @@ impl OnboardingBridge {
 mod tests;
 
 #[cfg(test)]
+mod fee_fuzz_tests;
+
+#[cfg(test)]
+mod fund_amount_fuzz_tests;
+
+#[cfg(test)]
 mod benchmarks;
 
 #[cfg(test)]
