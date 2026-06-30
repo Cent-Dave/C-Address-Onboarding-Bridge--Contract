@@ -152,6 +152,8 @@ stateDiagram-v2
 
 ### SDK (`sdk/`)
 
+Detailed type definitions, classes, and method signatures are available in the [SDK API Reference](sdk/API_REFERENCE.md).
+
 - `OnboardingBridgeSDK` — Wraps all contract calls, handles tx building/signing
 - `OffRampIntegration` — Moonpay/Transak URL generation + CEX memo encoding
 
