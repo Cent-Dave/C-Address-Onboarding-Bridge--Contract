@@ -126,3 +126,51 @@ jobs:
 
       - name: Build SDK
         run: npm run build
+
+  sdk-matrix:
+    name: SDK Compatibility Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+        npm-version: [9, 10]
+      fail-fast: false
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Setup npm ${{ matrix.npm-version }}
+        run: npm install -g npm@${{ matrix.npm-version }}
+
+      - name: Display versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: sdk/node_modules
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ matrix.npm-version }}-${{ hashFiles('sdk/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build SDK
+        run: npm run build
