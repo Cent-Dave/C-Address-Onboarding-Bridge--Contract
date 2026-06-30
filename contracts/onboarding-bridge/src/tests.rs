@@ -1504,7 +1504,7 @@ fn test_batch_negative_amount_rejected() {
 
 /// Fee causes net_amount == 0 — transfer is skipped, fee still accrues.
 /// At 1000 bps (10%), an amount of 9 → fee=0 (rounds down), net=9, transfer happens.
-/// At 1000 bps, amount=1 → fee=0 (1*1000/10000 = 0), net=1. 
+/// At 1000 bps, amount=1 → fee=0 (1*1000/10000 = 0), net=1.
 /// To get net==0 we need fee_bps=10000 which exceeds max. Instead, use fee_bps=1000 and
 /// amount=1: fee = 1*1000/10000 = 0, net = 1. Can't get net=0 with valid fee_bps.
 /// The contract MAX_FEE_BPS is 1000 (10%), so with amount=1: fee=0, net=1.
@@ -1631,6 +1631,26 @@ fn test_batch_100_targets() {
     }
     // Source spent 100_000 tokens from the extra mint.
     assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128); // original unchanged
+}
+
+/// Batches larger than MAX_BATCH_SIZE (100) must be rejected.
+#[test]
+fn test_batch_exceeds_max_size() {
+    let env = Env::default();
+    let (bridge, user, token_id, _) = setup_batch(&env);
+
+    let mut targets: Vec<Address> = Vec::new(&env);
+    let mut amounts: Vec<i128> = Vec::new(&env);
+    for _ in 0..101 {
+        targets.push_back(Address::generate(&env));
+        amounts.push_back(1i128);
+    }
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128);
 }
 
 /********** Nonce tests **********/
@@ -1821,6 +1841,153 @@ fn test_batch_fund_deadline_in_future_passes() {
     let amounts = Vec::from_array(&env, [1000i128]);
     bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &Some(9999u64));
     assert_eq!(check_balance(&env, &token_id, &t1), 990i128); // 1% fee
+}
+
+/********** Timelocked funding tests **********/
+
+#[cfg(test)]
+mod timelocked_tests {
+    use super::*;
+
+    fn setup_timelocked(env: &Env) -> (
+        crate::OnboardingBridgeClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
+        let (bridge_id, token_id) = register_all_contracts(env);
+        let bridge = create_bridge_client(env, &bridge_id);
+        let (admin, user, fee_collector) = create_test_users(env);
+        init_token(env, &token_id, &admin);
+        bridge.initialize(&admin, &fee_collector, &100u32, &None); // 1% fee
+        bridge.add_asset(&token_id, &None);
+        mint_tokens(env, &token_id, &user, 10_000i128);
+        (bridge, user, token_id, fee_collector, admin)
+    }
+
+    #[test]
+    fn test_timelocked_happy_path() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+        let release_time = 1_100u64;
+
+        let id = bridge.fund_c_address_timelocked(
+            &user,
+            &target,
+            &token_id,
+            &500i128,
+            &release_time,
+            &0u64,
+        );
+
+        env.ledger().set_timestamp(release_time + 1);
+        bridge.claim_timelocked(&id);
+
+        assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
+    }
+
+    #[test]
+    fn test_timelocked_claim_before_release_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(2_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+
+        let id = bridge.fund_c_address_timelocked(
+            &user,
+            &target,
+            &token_id,
+            &500i128,
+            &(2_100u64),
+            &0u64,
+        );
+
+        assert_eq!(
+            bridge.try_claim_timelocked(&id),
+            Err(Ok(BridgeError::TimelockNotMatured))
+        );
+    }
+
+    #[test]
+    fn test_timelocked_cliff_time_after_release_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(3_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user,
+                &target,
+                &token_id,
+                &500i128,
+                &3_100u64,
+                &3_101u64,
+            ),
+            Err(Ok(BridgeError::InvalidReleaseTime))
+        );
+    }
+
+    #[test]
+    fn test_timelocked_release_in_past_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(4_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user,
+                &target,
+                &token_id,
+                &500i128,
+                &4_000u64,
+                &0u64,
+            ),
+            Err(Ok(BridgeError::InvalidReleaseTime))
+        );
+    }
+
+    #[test]
+    fn test_timelocked_double_claim_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(5_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+        let release_time = 5_050u64;
+
+        let id = bridge.fund_c_address_timelocked(
+            &user,
+            &target,
+            &token_id,
+            &500i128,
+            &release_time,
+            &0u64,
+        );
+
+        env.ledger().set_timestamp(release_time + 1);
+        bridge.claim_timelocked(&id);
+
+        assert_eq!(
+            bridge.try_claim_timelocked(&id),
+            Err(Ok(BridgeError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_query_timelocked_unknown_id_fails() {
+        let env = Env::default();
+        let (bridge, _user, _token_id, _fee_collector, _admin) = setup_timelocked(&env);
+
+        assert_eq!(
+            bridge.try_query_timelocked(&999_999u64),
+            Err(Ok(BridgeError::TimelockNotFound))
+        );
+    }
 }
 
 /********** Cross-chain Onboarding Tests **********/
