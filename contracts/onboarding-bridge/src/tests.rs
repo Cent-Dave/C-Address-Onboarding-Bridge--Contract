@@ -2564,3 +2564,192 @@ fn test_pause_requires_admin_auth() {
 
     bridge.pause(&None);
 }
+
+// ---------------------------------------------------------------------------
+// #48 — i128 edge-case tests
+//
+// Verifies that the contract handles (or correctly rejects) extreme i128
+// values during fee calculation and fund operations.
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a bridge with a token and a funded source account.
+fn setup_for_large_amounts(env: &Env, fee_bps: u32, source_balance: i128)
+    -> (Address, Address, Address, crate::OnboardingBridgeClient<'_>)
+{
+    let (admin, user, fee_collector) = create_test_users(env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    init_token(env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &fee_bps, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(env, &token_id, &user, source_balance);
+    (user, bridge_id, token_id, bridge)
+}
+
+/// i128::MAX as a transfer amount must be rejected because the fee
+/// calculation (`amount * fee_bps`) overflows — the contract returns
+/// BridgeError::Overflow.
+#[test]
+fn test_fund_i128_max_overflows_fee_calculation() {
+    let env = Env::default();
+    // Use fee_bps = 100 (1%) — any non-zero fee causes overflow with i128::MAX
+    let (user, _bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 100, i128::MAX);
+    let target = Address::generate(&env);
+
+    let result = bridge.try_fund_c_address(&user, &target, &token_id, &i128::MAX, &None, &None);
+    assert_eq!(result, Err(Ok(BridgeError::Overflow)));
+}
+
+/// i128::MAX with zero fee bps: the contract charges no fee, so there is no
+/// multiplication — the transfer itself succeeds (the token mock allows it).
+#[test]
+fn test_fund_i128_max_zero_fee_succeeds() {
+    let env = Env::default();
+    let (user, _bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 0, i128::MAX);
+    let target = Address::generate(&env);
+
+    bridge.fund_c_address(&user, &target, &token_id, &i128::MAX, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &user), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &target), i128::MAX);
+}
+
+/// i128::MIN + 1 is the smallest representable positive value (-170...07).
+/// That is still a negative number — the contract must reject it as
+/// InvalidAmount (amount ≤ 0).
+#[test]
+fn test_fund_i128_min_plus_one_rejected_as_invalid() {
+    let env = Env::default();
+    // Balance doesn't matter — the contract validates before touching funds.
+    let (user, _bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 100, 1_000_000i128);
+    let target = Address::generate(&env);
+
+    // i128::MIN + 1 is still a large negative number
+    let result = bridge.try_fund_c_address(
+        &user,
+        &target,
+        &token_id,
+        &(i128::MIN + 1),
+        &None,
+        &None,
+    );
+    assert_eq!(result, Err(Ok(BridgeError::InvalidAmount)));
+}
+
+/// Zero is not a valid amount — the contract must return InvalidAmount.
+#[test]
+fn test_fund_zero_amount_rejected() {
+    let env = Env::default();
+    let (user, _bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 50, 1_000_000i128);
+    let target = Address::generate(&env);
+
+    let result = bridge.try_fund_c_address(&user, &target, &token_id, &0i128, &None, &None);
+    assert_eq!(result, Err(Ok(BridgeError::InvalidAmount)));
+}
+
+/// Negative amounts must also be rejected as InvalidAmount.
+#[test]
+fn test_fund_negative_amount_rejected() {
+    let env = Env::default();
+    let (user, _bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 50, 1_000_000i128);
+    let target = Address::generate(&env);
+
+    let result = bridge.try_fund_c_address(&user, &target, &token_id, &-1i128, &None, &None);
+    assert_eq!(result, Err(Ok(BridgeError::InvalidAmount)));
+}
+
+/// 2^127 - 1 is the maximum positive i128 (same as i128::MAX).
+/// With a non-zero fee the multiplication must overflow.
+#[test]
+fn test_fund_2_pow_127_minus_1_overflows_fee() {
+    const MAX_I128: i128 = i128::MAX; // 2^127 - 1
+    let env = Env::default();
+    let (user, _bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 50, MAX_I128);
+    let target = Address::generate(&env);
+
+    let result = bridge.try_fund_c_address(&user, &target, &token_id, &MAX_I128, &None, &None);
+    assert_eq!(result, Err(Ok(BridgeError::Overflow)));
+}
+
+/// i128::MAX / 2 with a small fee (1 bps = 0.01%) must NOT overflow because
+/// (MAX/2) * 1 < i128::MAX, and the fee deduction also fits.
+/// The net amount reaching the target must be exactly (amount - fee).
+#[test]
+fn test_fund_i128_max_half_small_fee_succeeds() {
+    let env = Env::default();
+    let amount = i128::MAX / 2; // ~85 * 10^36
+    let fee_bps: i128 = 1; // 0.01%
+    let expected_fee = amount * fee_bps / 10_000;
+    let expected_net = amount - expected_fee;
+
+    let (user, bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 1u32, amount);
+    let target = Address::generate(&env);
+
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &user), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &target), expected_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), expected_fee);
+}
+
+/// An amount close to 10^38 (slightly above i128::MAX / 10) with a 1% fee
+/// overflows the multiplication and must return BridgeError::Overflow.
+#[test]
+fn test_fund_near_10_pow_38_overflows() {
+    // 10^38 > i128::MAX (~1.7 * 10^38), so we use i128::MAX / 10 * 9
+    // which is large enough to cause (amount * 100) to overflow.
+    let amount: i128 = i128::MAX / 10 * 9; // ~1.53 * 10^38
+    let env = Env::default();
+    let (user, _bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 100, amount);
+    let target = Address::generate(&env);
+
+    let result = bridge.try_fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+    assert_eq!(result, Err(Ok(BridgeError::Overflow)));
+}
+
+/// Batch fund with an overflow amount — every element that would overflow must
+/// be skipped with a BatchTransferFailed event, not panic the whole call.
+/// With zero fee they all succeed; with non-zero fee each overflows individually.
+#[test]
+fn test_batch_fund_i128_max_overflow_each_element() {
+    let env = Env::default();
+    let (user, bridge_id, token_id, bridge) = setup_for_large_amounts(&env, 100, i128::MAX);
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target1.clone(), target2.clone()]);
+    // i128::MAX for each element — fee calc overflows, so each transfer fails
+    // and the batch refunds the source.
+    let amounts = Vec::from_array(&env, [i128::MAX / 2, i128::MAX / 2]);
+
+    // i128::MAX / 2 * 100 overflows → both batch elements fail gracefully
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // Both targets get nothing; source is refunded
+    assert_eq!(check_balance(&env, &token_id, &target1), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &target2), 0i128);
+    // bridge should hold no extra fees (transfers failed)
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
+}
+
+/// Large but valid amount: just below the overflow threshold for 1 bps fee.
+/// Ensures the contract accepts amounts at the practical upper bound.
+#[test]
+fn test_fund_just_below_overflow_threshold_succeeds() {
+    let env = Env::default();
+    // With fee_bps = 1: threshold where amount * 1 overflows is > i128::MAX
+    // So any positive value is safe with fee_bps = 1.
+    // With fee_bps = 1000: amount * 1000 overflows when amount > i128::MAX / 1000
+    let fee_bps: u32 = 1000; // max allowed (10%)
+    let safe_amount = i128::MAX / 1000; // just at the boundary
+    let expected_fee = safe_amount * 1000 / 10_000; // = safe_amount / 10
+    let expected_net = safe_amount - expected_fee;
+
+    let (user, bridge_id, token_id, bridge) = setup_for_large_amounts(&env, fee_bps, safe_amount);
+    let target = Address::generate(&env);
+
+    bridge.fund_c_address(&user, &target, &token_id, &safe_amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &user), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &target), expected_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), expected_fee);
+}
