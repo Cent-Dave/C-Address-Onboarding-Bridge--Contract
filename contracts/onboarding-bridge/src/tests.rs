@@ -2499,3 +2499,66 @@ fn test_schedule_upgrade_non_admin_rejected() {
     env.set_auths(&[]);
     bridge.schedule_upgrade(&new_hash, &None);
 }
+
+// ── Deployment verification smoke tests (Issue #73) ─────────────────────────
+
+#[test]
+fn smoke_deployment_not_initialized_initially() {
+    let env = Env::default();
+    let bridge_id = env.register(OnboardingBridge, ());
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert!(!bridge.query_is_initialized());
+}
+
+#[test]
+fn smoke_deployment_initialize_and_verify() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let bridge_id = env.register(OnboardingBridge, ());
+    env.mock_all_auths();
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    assert!(bridge.query_is_initialized());
+    assert_eq!(bridge.query_admin(), admin);
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+    assert_eq!(bridge.query_fee_bps(), 100u32);
+}
+
+#[test]
+fn smoke_deployment_funding_works() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &100i128, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), 99i128);
+}
+
+#[test]
+fn smoke_deployment_query_functions() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert!(bridge.query_is_initialized());
+    assert_eq!(bridge.query_fee_bps(), 50u32);
+    assert_eq!(bridge.query_admin(), admin);
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+    assert_eq!(bridge.query_minimum_amount(), 0i128);
+    assert_eq!(bridge.query_whitelisted_assets().len(), 0);
+    assert!(bridge.query_pending_upgrade().is_none());
+}
