@@ -176,6 +176,8 @@ pub enum DataKey {
     MaxWithdrawPerTx,
     // Issue #24: reentrancy guard flag
     Entered,
+    // Issue #163: minimum amount
+    MinimumAmount,
 }
 
 // ---------------------------------------------------------------------------
@@ -479,17 +481,17 @@ fn mark_initialized(env: &Env) {
     env.storage().instance().set(&DataKey::Initialized, &true);
 }
 
-// TODO: persist minimum_amount to storage so set_minimum_amount / query_minimum_amount
-// actually work.  Current stubs are no-ops and the feature is silently broken.
 #[inline(never)]
 fn save_minimum_amount(env: &Env, amount: &i128) {
-    let _ = (env, amount);
+    env.storage().instance().set(&DataKey::MinimumAmount, amount);
 }
 
 #[inline(never)]
 fn read_minimum_amount(env: &Env) -> i128 {
-    let _ = env;
-    0
+    env.storage()
+        .instance()
+        .get(&DataKey::MinimumAmount)
+        .unwrap_or(0)
 }
 
 fn check_initialized(env: &Env) -> Result<(), BridgeError> {
@@ -1169,6 +1171,10 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        let minimum_amount = read_minimum_amount(&env);
+        if amount < minimum_amount {
+            return Err(BridgeError::InvalidAmount);
+        }
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
@@ -1287,10 +1293,14 @@ impl OnboardingBridge {
         source.require_auth();
         consume_nonce(&env, &source, nonce)?;
 
+        let minimum_amount = read_minimum_amount(&env);
         let mut total: i128 = 0;
         for i in 0..targets.len() {
             let amount = amounts.get(i).unwrap();
             if amount <= 0 {
+                return Err(BridgeError::InvalidAmount);
+            }
+            if amount < minimum_amount {
                 return Err(BridgeError::InvalidAmount);
             }
             total += amount;
