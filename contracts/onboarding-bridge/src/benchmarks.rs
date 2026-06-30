@@ -94,11 +94,11 @@ fn mint(env: &Env, token_id: &Address, to: &Address, amount: i128) {
 
 /// Reset the budget tracker, run `f`, then capture and print costs.
 fn measure(env: &Env, name: &str, f: impl FnOnce()) {
-    env.budget().reset_unlimited();
-    env.budget().reset_tracker();
+    env.cost_estimate().budget().reset_unlimited();
+    env.cost_estimate().budget().reset_tracker();
     f();
-    let cpu = env.budget().cpu_instruction_cost();
-    let mem = env.budget().memory_bytes_cost();
+    let cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let mem = env.cost_estimate().budget().memory_bytes_cost();
     // Tab-separated so CI can parse it with `column -t`
     println!("BENCH\t{name}\t{cpu}\t{mem}");
 }

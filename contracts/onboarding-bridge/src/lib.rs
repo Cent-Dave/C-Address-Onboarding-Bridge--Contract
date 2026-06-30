@@ -85,7 +85,6 @@ pub enum DataKey {
 
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
-#[allow(dead_code)]
 const MAX_BATCH_SIZE: u32 = 100;
 const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
@@ -913,6 +912,9 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
+        if targets.len() > MAX_BATCH_SIZE {
+            return Err(BridgeError::InvalidAmount);
+        }
         if let Some(d) = deadline {
             if env.ledger().timestamp() > d {
                 return Err(BridgeError::TransactionExpired);
