@@ -44,6 +44,8 @@ const CONFIG = {
   contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
   rpcUrl: 'https://soroban-testnet.stellar.org',
   networkPassphrase: 'Test SDF Network ; September 2015',
+  // Keep retry backoff instant so tests that exercise transient errors stay fast.
+  retry: { baseDelayMs: 0, maxDelayMs: 0 },
 };
 
 const MOCK_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';

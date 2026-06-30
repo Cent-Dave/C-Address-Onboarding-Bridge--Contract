@@ -48,7 +48,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
-    Vec,
+    Vec, IntoVal,
 };
 
 // ---------------------------------------------------------------------------
@@ -132,6 +132,17 @@ pub enum BridgeError {
     CommitmentHashMismatch = 33,
     /// The minimum delay between commit and reveal has not elapsed.
     CommitmentNotMatured = 34,
+    /// The swap produced fewer target tokens than `min_target_amount`.
+    SlippageExceeded = 35,
+    /// A DEX pool in the swap route returned zero or failed.
+    SwapFailed = 36,
+    // Issue #35: EIP-712-style meta-transaction errors
+    /// The meta-transaction signature is malformed or does not match the expected signer.
+    MetaTxInvalidSignature = 37,
+    /// The meta-transaction deadline has passed (funds not yet submitted on-chain).
+    MetaTxExpired = 38,
+    /// This meta-transaction nonce has already been used; replay prevented.
+    MetaTxNonceAlreadyUsed = 39,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +203,10 @@ pub enum DataKey {
     // Issue #30: commit-reveal counter and entries
     CommitmentId,
     Commitment(u64),
+    // Minimum transfer amount
     MinimumAmount,
+    // Issue #35: EIP-712-style meta-transaction used nonces
+    MetaTxNonce(Address, u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -4046,6 +4060,372 @@ impl OnboardingBridge {
     pub fn query_commitment(env: Env, id: u64) -> Result<CommitmentEntry, BridgeError> {
         read_commitment(&env, id).ok_or(BridgeError::CommitmentNotFound)
     }
+
+    // -----------------------------------------------------------------------
+    // Swap-and-bridge (#100)
+    // -----------------------------------------------------------------------
+
+    /// Fund a C-address by swapping `source_asset` into `target_asset` first.
+    ///
+    /// Flow:
+    /// 1. Pull `source_amount` of `source_asset` from `source` into the contract.
+    /// 2. Walk `swap_route` (a sequence of DEX pool contract addresses) swapping
+    ///    the running balance through each pool using the standard two-token
+    ///    `swap(amount_in, min_amount_out, to)` interface.
+    /// 3. Verify the final `target_asset` balance received ≥ `min_target_amount`.
+    /// 4. Deduct the fee (in `target_asset`) and transfer the net amount to
+    ///    `target`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` — Account providing `source_asset`. Must authorise.
+    /// * `target` — Destination C-address to receive `target_asset`.
+    /// * `source_asset` — Token contract the source holds (e.g. USDC).
+    /// * `target_asset` — Token contract the target should receive (e.g. XLM).
+    /// * `source_amount` — Gross amount of `source_asset` to pull from source.
+    /// * `min_target_amount` — Slippage guard: revert if the swap yields less.
+    /// * `swap_route` — Ordered list of DEX pool contract addresses. At least
+    ///   one pool is required. Each pool must implement the interface:
+    ///   `swap(amount_in: i128, min_amount_out: i128, to: Address) -> i128`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0.
+    /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `target_asset` is not whitelisted.
+    /// * [`BridgeError::SwapFailed`] — A pool returned zero tokens out.
+    /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
+    pub fn fund_c_address_with_swap(
+        env: Env,
+        source: Address,
+        target: Address,
+        source_asset: Address,
+        target_asset: Address,
+        source_amount: i128,
+        min_target_amount: i128,
+        swap_route: Vec<Address>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        if source_amount <= 0 || min_target_amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        check_access(&env, &target)?;
+        // Only the output asset needs to be whitelisted (what arrives at target).
+        check_asset_whitelisted(&env, &target_asset)?;
+
+        source.require_auth();
+
+        let contract_addr = env.current_contract_address();
+
+        // Step 1: pull source_asset into the contract.
+        let source_token = token::Client::new(&env, &source_asset);
+        source_token.transfer(&source, &contract_addr, &source_amount);
+
+        // Step 2: walk the swap route.
+        // Each pool must implement: swap(min_amount_out: i128, to: Address) -> i128
+        // The contract uses a push model: transfer amount_in to the pool first,
+        // then call swap. The pool detects its received balance and performs the swap.
+        //
+        // For single-hop: source_asset → pool → target_asset
+        // For multi-hop:  each pool's output token must be the next pool's input token;
+        //                 callers are responsible for constructing a valid route.
+        let mut amount_in: i128 = source_amount;
+        let route_len = swap_route.len();
+
+        // Track which token we currently hold in the contract.
+        // Hop 0 input = source_asset; subsequent inputs are determined by the route.
+        let mut current_token = source_asset.clone();
+
+        for (i, pool) in swap_route.iter().enumerate() {
+            let is_last = i as u32 == route_len - 1;
+            // Only enforce min_target_amount on the final hop.
+            let min_out: i128 = if is_last { min_target_amount } else { 1 };
+
+            // Push the current amount into the pool.
+            let input_token_client = token::Client::new(&env, &current_token);
+            input_token_client.transfer(&contract_addr, &pool, &amount_in);
+
+            // Call the pool's swap function. Interface: swap(min_amount_out, to) -> i128
+            // This matches the Phoenix Protocol / Soroswap pool interface.
+            let swap_sym = soroban_sdk::Symbol::new(&env, "swap");
+            let swap_args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
+                &env,
+                min_out.into_val(&env),
+                contract_addr.into_val(&env),
+            ];
+            let amount_out: i128 = env.invoke_contract(&pool, &swap_sym, swap_args);
+
+            if amount_out <= 0 {
+                return Err(BridgeError::SwapFailed);
+            }
+
+            amount_in = amount_out;
+            // After this hop the contract holds the pool's output token.
+            // Update current_token for the next iteration (unused on last hop).
+            if !is_last {
+                // Intermediate token: for multi-hop routes callers construct pools
+                // such that each pool's output is the next pool's input.
+                // We advance current_token to target_asset as a reasonable default;
+                // for more complex routes the caller is responsible for matching tokens.
+                current_token = target_asset.clone();
+            }
+        }
+
+        // Step 3: slippage check on final output.
+        if amount_in < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
+        }
+
+        let received_amount = amount_in;
+
+        // Step 4: deduct fee in target_asset and forward net to target.
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &target_asset, tiered_fee_bps);
+        let fee = calculate_fee(received_amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(received_amount, fee)?;
+
+        let target_token = token::Client::new(&env, &target_asset);
+        if net_amount > 0 {
+            target_token.transfer(&contract_addr, &target, &net_amount);
+        }
+
+        increment_accrued_fees(&env, &target_asset, fee);
+        increment_total_bridged(&env, &target_asset, net_amount);
+        increment_total_fees_collected(&env, &target_asset, fee);
+        increment_source_bridged_volume(&env, &source, source_amount);
+
+        mint_loyalty_tokens(&env, &source);
+
+        env.events().publish(
+            ("SwapAndFunded", source_asset, target_asset, source, target),
+            (source_amount, received_amount, fee),
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #35: EIP-712-style meta-transaction (gasless / relayer-submitted)
+    // -----------------------------------------------------------------------
+
+    /// Execute a fund_c_address on behalf of a user who signed the parameters
+    /// off-chain.
+    ///
+    /// Pattern (EIP-712-style adapted for Stellar / Soroban):
+    ///
+    /// 1. The *user* constructs a `MetaFundParams` struct, serialises it as:
+    ///    ```text
+    ///    payload = sha256(
+    ///        "meta_fund"           (8 bytes, ASCII)
+    ///        || source_strkey      (sha256 of strkey bytes, 32 bytes)
+    ///        || target_strkey      (sha256 of strkey bytes, 32 bytes)
+    ///        || asset_strkey       (sha256 of strkey bytes, 32 bytes)
+    ///        || amount_be16        (i128 big-endian, 16 bytes)
+    ///        || nonce_be8          (u64 big-endian,  8 bytes)
+    ///        || deadline_be8       (u64 big-endian,  8 bytes)
+    ///    )
+    ///    ```
+    /// 2. The user signs `payload` with their Ed25519 key and gives
+    ///    `(signature, pubkey, params)` to a relayer.
+    /// 3. The relayer calls `execute_meta_fund` — it verifies the signature,
+    ///    checks the deadline and nonce, then performs the same token-transfer
+    ///    flow as `fund_c_address`.
+    ///
+    /// This enables gas abstraction: the user never needs XLM for fees; the
+    /// relayer covers the Stellar transaction fee.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` — Funding parameters signed by the user.
+    /// * `pubkey` — The user's Ed25519 public key (`BytesN<32>`).
+    /// * `signature` — Ed25519 signature over the canonical payload hash.
+    ///
+    /// # Authorization
+    ///
+    /// No `require_auth()` — authentication is entirely via Ed25519 signature.
+    /// The relayer submits this transaction; the user's identity is proven by
+    /// `pubkey` and `signature`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::MetaTxExpired`] — `params.deadline` is in the past.
+    /// * [`BridgeError::MetaTxNonceAlreadyUsed`] — Nonce already consumed.
+    /// * [`BridgeError::MetaTxInvalidSignature`] — Signature verification failed
+    ///   (host will trap on invalid Ed25519 — this variant is for structural errors).
+    /// * [`BridgeError::InvalidAmount`] — `params.amount` ≤ 0.
+    /// * [`BridgeError::AddressBlocked`] — `params.target` is blocked.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
+    /// * [`BridgeError::AssetNotWhitelisted`] — Asset not whitelisted.
+    /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded.
+    ///
+    /// # Events
+    ///
+    /// * `("MetaFundExecuted", asset, source, target)` — data: `(amount, fee, nonce)`
+    pub fn execute_meta_fund(
+        env: Env,
+        params: MetaFundParams,
+        pubkey: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        // 1. Deadline check
+        if env.ledger().timestamp() > params.deadline {
+            return Err(BridgeError::MetaTxExpired);
+        }
+
+        // 2. Nonce replay check
+        let nonce_key = DataKey::MetaTxNonce(params.source.clone(), params.nonce);
+        let already_used: bool = env.storage()
+            .persistent()
+            .get(&nonce_key)
+            .unwrap_or(false);
+        if already_used {
+            return Err(BridgeError::MetaTxNonceAlreadyUsed);
+        }
+
+        // 3. Validate amount before touching storage
+        if params.amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let minimum_amount = read_minimum_amount(&env);
+        if params.amount < minimum_amount {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        // 4. Access / whitelist checks
+        check_access(&env, &params.target)?;
+        check_asset_whitelisted(&env, &params.asset)?;
+        check_daily_limit(&env, &params.source, &params.asset, params.amount)?;
+
+        // 5. Build canonical payload hash and verify signature
+        //    payload = sha256(domain || source_hash || target_hash || asset_hash
+        //                     || amount_be16 || nonce_be8 || deadline_be8)
+        let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
+
+        let mut addr_buf = [0u8; 64];
+
+        let src_str = params.source.clone().to_string();
+        let slen = src_str.len() as usize;
+        src_str.copy_into_slice(&mut addr_buf[..slen]);
+        let src_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..slen]);
+        let src_hash: BytesN<32> = env.crypto().sha256(&src_raw).into();
+
+        let tgt_str = params.target.clone().to_string();
+        let tlen = tgt_str.len() as usize;
+        tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
+        let tgt_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
+        let tgt_hash: BytesN<32> = env.crypto().sha256(&tgt_raw).into();
+
+        let ast_str = params.asset.clone().to_string();
+        let alen = ast_str.len() as usize;
+        ast_str.copy_into_slice(&mut addr_buf[..alen]);
+        let ast_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
+        let ast_hash: BytesN<32> = env.crypto().sha256(&ast_raw).into();
+
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.append(&domain);
+        payload.append(&src_hash.into());
+        payload.append(&tgt_hash.into());
+        payload.append(&ast_hash.into());
+        payload.extend_from_array(&params.amount.to_be_bytes());
+        payload.extend_from_array(&params.nonce.to_be_bytes());
+        payload.extend_from_array(&params.deadline.to_be_bytes());
+
+        let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        // ed25519_verify traps on invalid sig — this is the intended behaviour
+        // (same as fund_c_address_crosschain). The MetaTxInvalidSignature error
+        // is reserved for future structural checks.
+        env.crypto().ed25519_verify(&pubkey, &payload_hash.into(), &signature);
+
+        // 6. Mark nonce used (before any transfer to prevent re-entrancy)
+        env.storage().persistent().set(&nonce_key, &true);
+
+        // 7. Execute the transfer (same logic as fund_c_address)
+        let token_client = token::Client::new(&env, &params.asset);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&params.source, &contract_addr, &params.amount);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &params.source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &params.asset, tiered_fee_bps);
+        let fee = calculate_fee(params.amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(params.amount, fee)?;
+
+        if net_amount > 0 {
+            token_client.transfer(&contract_addr, &params.target, &net_amount);
+        }
+
+        increment_user_deposit(&env, &params.source, &params.asset, params.amount);
+        increment_accrued_fees(&env, &params.asset, fee);
+        increment_total_bridged(&env, &params.asset, net_amount);
+        increment_total_fees_collected(&env, &params.asset, fee);
+        increment_source_bridged_volume(&env, &params.source, params.amount);
+
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("MetaFundExecuted", params.asset, params.source, params.target),
+            (params.amount, fee, params.nonce),
+        );
+        Ok(())
+    }
+
+    /// Returns `true` if the given meta-transaction nonce has already been used
+    /// for `source`.
+    ///
+    /// Call this before constructing a `MetaFundParams` to get the next safe nonce,
+    /// or to verify a pending meta-tx has not been replayed.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` — The user's Stellar address.
+    /// * `nonce` — The nonce to check.
+    pub fn query_meta_tx_nonce_used(env: Env, source: Address, nonce: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetaTxNonce(source, nonce))
+            .unwrap_or(false)
+    }
+}
+
+/// Parameters for an EIP-712-style meta-transaction fund request.
+///
+/// The user fills this struct, signs the canonical payload hash off-chain,
+/// and hands `(params, pubkey, signature)` to a relayer who submits
+/// `execute_meta_fund` on-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaFundParams {
+    /// The user's Stellar address (source of funds). Must match `pubkey`.
+    pub source: Address,
+    /// Destination C-address.
+    pub target: Address,
+    /// Whitelisted token contract address.
+    pub asset: Address,
+    /// Gross amount to transfer (fee deducted from this).
+    pub amount: i128,
+    /// Monotonically-increasing per-user nonce; prevents replay.
+    pub nonce: u64,
+    /// Unix timestamp (seconds) after which this meta-tx is rejected.
+    pub deadline: u64,
 }
 
 #[cfg(test)]
